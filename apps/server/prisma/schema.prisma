@@ -1,0 +1,424 @@
+// Prisma Schema for Poker Server
+// 数据库模型定义
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// 用户表
+model User {
+  id        String   @id @default(uuid())
+  username  String   @unique @db.VarChar(32)
+  email     String   @unique @db.VarChar(255)
+  password  String   @db.VarChar(255)
+  avatarUrl String?  @db.VarChar(255)
+  role      UserRole @default(USER)
+  status    UserStatus @default(ACTIVE)
+  
+  // 账户信息
+  balance   BigInt   @default(0)
+  
+  // 统计信息
+  totalGames   Int @default(0)
+  totalWins    Int @default(0)
+  totalLosses  Int @default(0)
+  totalBuyIn   BigInt @default(0)
+  totalCashOut BigInt @default(0)
+  
+  // 时间戳
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  lastLoginAt DateTime?
+  
+  // 关系
+  rooms     RoomMember[]
+  gamePlayers GamePlayer[]
+  actions   GameAction[]
+  transactions Transaction[]
+  refreshTokens RefreshToken[]
+  
+  @@index([email])
+  @@index([username])
+  @@map("users")
+}
+
+// 刷新令牌表
+model RefreshToken {
+  id        String   @id @default(uuid())
+  token     String   @unique @db.VarChar(64)  // SHA256哈希，64字符
+  userId    String
+  familyId  String   @default(uuid())  // Token家族ID，用于追踪被盗用的token
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([familyId])
+  @@map("refresh_tokens")
+}
+
+// 房间表
+model Room {
+  id        String   @id @default(uuid())
+  code      String   @unique @db.VarChar(6)
+  name      String   @db.VarChar(64)
+  
+  // 配置
+  maxPlayers   Int    @default(9)
+  smallBlind   Int
+  bigBlind     Int
+  minBuyIn     Int
+  maxBuyIn     Int
+  isPrivate    Boolean @default(false)
+  passwordHash String? @db.VarChar(255)
+  
+  // 状态
+  status    RoomStatus @default(WAITING)
+  
+  // 时间戳
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  endedAt   DateTime?
+  
+  // 关系
+  members   RoomMember[]
+  games     Game[]
+  messages  ChatMessage[]
+  
+  @@index([code])
+  @@index([status])
+  @@map("rooms")
+}
+
+// 房间成员表
+model RoomMember {
+  id          String @id @default(uuid())
+  roomId      String
+  userId      String
+  seatNumber  Int
+  isReady     Boolean @default(false)
+  isHost      Boolean @default(false)
+  buyInAmount Int
+  
+  joinedAt    DateTime @default(now())
+  leftAt      DateTime?
+  
+  room        Room   @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user        User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@unique([roomId, userId])
+  @@unique([roomId, seatNumber])
+  @@index([roomId])
+  @@index([userId])
+  @@map("room_members")
+}
+
+// 游戏表
+model Game {
+  id        String   @id @default(uuid())
+  roomId    String
+  
+  // 状态
+  status    GameStatus @default(WAITING)
+  round     GameRound?
+  
+  // 牌面信息
+  communityCards String[] @default([])
+  
+  // 底池
+  mainPot   BigInt @default(0)
+  sidePots  Json?  // SidePot[]
+  
+  // 盲注位置
+  dealerSeat    Int
+  smallBlindSeat Int
+  bigBlindSeat  Int
+  
+  // 时间戳
+  startedAt DateTime?
+  endedAt   DateTime?
+  createdAt DateTime @default(now())
+  
+  // 关系
+  room      Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  players   GamePlayer[]
+  actions   GameAction[]
+  
+  @@index([roomId])
+  @@index([status])
+  @@map("games")
+}
+
+// 游戏玩家表
+model GamePlayer {
+  id        String   @id @default(uuid())
+  gameId    String
+  userId    String
+  
+  // 座位信息
+  seatNumber   Int
+  position     PlayerPosition
+  
+  // 手牌
+  holeCards    String[] @default([])
+  
+  // 筹码
+  initialChips BigInt
+  finalChips   BigInt?
+  
+  // 状态
+  isFolded     Boolean @default(false)
+  isAllIn      Boolean @default(false)
+  isWinner     Boolean @default(false)
+  winAmount    BigInt @default(0)
+  
+  // 最佳牌型
+  bestHandRank    Int?
+  bestHandDesc    String?
+  
+  createdAt   DateTime @default(now())
+  
+  game        Game   @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  user        User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@unique([gameId, userId])
+  @@unique([gameId, seatNumber])
+  @@index([gameId])
+  @@index([userId])
+  @@map("game_players")
+}
+
+// 游戏动作表
+model GameAction {
+  id        String   @id @default(uuid())
+  gameId    String
+  userId    String
+  
+  // 动作信息
+  actionType PlayerAction
+  amount     BigInt?
+  round      GameRound
+  
+  // 时间戳
+  createdAt DateTime @default(now())
+  
+  game      Game   @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  user      User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@index([gameId])
+  @@index([userId])
+  @@index([gameId, round])
+  @@map("game_actions")
+}
+
+// 游戏快照表 - 用于服务器重启后恢复游戏状态
+model GameSnapshot {
+  id          String   @id @default(uuid())
+  gameId      String
+  type        SnapshotType @default(PERIODIC)
+  
+  // 快照数据（JSON格式存储完整游戏状态）
+  state       Json
+  
+  // 完整性校验（HMAC-SHA256）
+  checksum    String?  @db.VarChar(64)
+  
+  // 创建时间
+  createdAt   DateTime @default(now())
+  
+  @@unique([gameId, type])  // 每种类型每个游戏只能有一个快照
+  @@index([gameId])
+  @@index([createdAt])
+  @@map("game_snapshots")
+}
+
+enum SnapshotType {
+  PERIODIC    // 定期快照
+  PRE_SHUTDOWN // 关闭前快照
+  POST_ACTION  // 每次动作后快照
+}
+
+// 聊天记录表
+model ChatMessage {
+  id        String   @id @default(uuid())
+  roomId    String
+  userId    String?
+  
+  message   String   @db.VarChar(500)
+  
+  createdAt DateTime @default(now())
+  
+  room      Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  
+  @@index([roomId])
+  @@index([createdAt])
+  @@map("chat_messages")
+}
+
+// 交易记录表
+model Transaction {
+  id        String   @id @default(uuid())
+  userId    String
+  
+  type      TransactionType
+  amount    BigInt
+  balanceAfter BigInt
+  
+  description String? @db.VarChar(255)
+  
+  createdAt DateTime @default(now())
+  
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@index([userId])
+  @@index([type])
+  @@index([createdAt])
+  @@map("transactions")
+}
+
+// 枚举定义
+enum UserRole {
+  USER
+  VIP
+  MODERATOR
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  BANNED
+}
+
+enum RoomStatus {
+  WAITING
+  PLAYING
+  ENDED
+}
+
+enum GameStatus {
+  WAITING
+  STARTING
+  PREFLOP
+  FLOP
+  TURN
+  RIVER
+  SHOWDOWN
+  ENDED
+}
+
+enum GameRound {
+  PREFLOP
+  FLOP
+  TURN
+  RIVER
+}
+
+enum PlayerPosition {
+  DEALER
+  SMALL_BLIND
+  BIG_BLIND
+  UTG
+  UTG1
+  MP
+  MP1
+  CO
+}
+
+enum PlayerAction {
+  FOLD
+  CHECK
+  CALL
+  RAISE
+  ALL_IN
+  SMALL_BLIND
+  BIG_BLIND
+}
+
+enum TransactionType {
+  DEPOSIT
+  WITHDRAW
+  GAME_WIN
+  GAME_LOSS
+  BUY_IN
+  CASH_OUT
+  BONUS
+  PENALTY
+}
+
+// 审计日志表
+// 生产环境建议按月分区或使用 PostgreSQL 表继承
+model AuditLog {
+  id          String   @id @default(uuid())
+  
+  // 操作者信息
+  userId      String?
+  sessionId   String?
+  ipAddress   String?  @db.VarChar(45)  // IPv6 最大长度
+  userAgent   String?
+  
+  // 操作信息
+  action      AuditAction
+  resource    String   @db.VarChar(100)  // 资源类型，如 'user', 'room', 'game'
+  resourceId  String?  @db.VarChar(100) // 资源ID
+  
+  // 变更详情
+  oldValue    Json?
+  newValue    Json?
+  
+  // 状态
+  success     Boolean @default(true)
+  errorMessage String?
+  
+  // 时间戳
+  createdAt   DateTime @default(now())
+  
+  @@index([userId])
+  @@index([action])
+  @@index([resource])
+  @@index([createdAt])
+  @@index([createdAt, action])  // 复合索引支持按时间和类型的查询
+  @@map("audit_logs")
+}
+
+enum AuditAction {
+  // 用户操作
+  USER_LOGIN
+  USER_LOGOUT
+  USER_REGISTER
+  USER_UPDATE
+  USER_DELETE
+  
+  // 房间操作
+  ROOM_CREATE
+  ROOM_JOIN
+  ROOM_LEAVE
+  ROOM_START
+  ROOM_END
+  
+  // 游戏操作
+  GAME_ACTION
+  GAME_START
+  GAME_END
+  GAME_WIN
+  GAME_LOSS
+  
+  // 财务操作
+  BALANCE_UPDATE
+  TRANSACTION_CREATE
+  WITHDRAW_REQUEST
+  WITHDRAW_APPROVE
+  WITHDRAW_REJECT
+  
+  // 管理操作
+  ADMIN_ACTION
+  SETTINGS_CHANGE
+}

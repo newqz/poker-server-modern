@@ -1,0 +1,181 @@
+# Prometheus 告警规则
+# 部署到 Prometheus 服务器的 /etc/prometheus/rules/poker-alerts.yml
+
+groups:
+  - name: poker_server_alerts
+    interval: 30s
+    rules:
+      # 服务不可用
+      - alert: PokerServerDown
+        expr: up{job="poker-server"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Poker 服务器不可用"
+          description: "Poker 服务器 {{ $labels.instance }} 已经停机超过 1 分钟"
+
+      # 高错误率
+      - alert: PokerHighErrorRate
+        expr: rate(poker_requests_total{status=~"5.."}[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Poker 服务器错误率过高"
+          description: "Poker 服务器 {{ $labels.instance }} 5xx 错误率超过 5%"
+
+      # 响应时间过长
+      - alert: PokerHighResponseTime
+        expr: poker_response_time_avg > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Poker 服务器响应时间过长"
+          description: "Poker 服务器 {{ $labels.instance }} 平均响应时间超过 1 秒"
+
+      # 活跃游戏数异常
+      - alert: PokerNoActiveGames
+        expr: poker_games_active == 0
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "没有活跃游戏"
+          description: "过去 30 分钟没有活跃游戏，可能服务异常"
+
+      # 内存使用过高
+      - alert: PokerHighMemoryUsage
+        expr: poker_memory_usage_bytes{type="heapUsed"} / poker_memory_usage_bytes{type="rss"} > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Poker 服务器内存使用过高"
+          description: "Heap 使用率超过 90%，可能存在内存泄漏"
+
+      # 连接数异常
+      - alert: PokerHighConnectionCount
+        expr: poker_connections_socket > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Poker 服务器连接数过高"
+          description: "Socket.io 连接数超过 1000，可能存在连接泄漏"
+
+      # 请求队列积压
+      - alert: PokerRequestBacklog
+        expr: rate(poker_requests_total[5m]) > 100
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Poker 服务器请求量大"
+          description: "请求速率超过 100/秒，注意扩容"
+
+  - name: poker_game_alerts
+    interval: 60s
+    rules:
+      # 游戏进行中异常中断
+      - alert: PokerGameInterrupted
+        expr: increase(poker_games_total_played[5m]) > 0 and poker_games_active == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "游戏异常中断"
+          description: "有游戏结束但没有活跃游戏，可能存在异常"
+
+      # 游戏数量为0
+      - alert: PokerNoGames
+        expr: poker_games_active == 0
+        for: 60m
+        labels:
+          severity: info
+        annotations:
+          summary: "无活跃游戏"
+          description: "过去 1 小时没有活跃游戏"
+
+  - name: poker_security_alerts
+    interval: 30s
+    rules:
+      # 认证失败率过高
+      - alert: PokerHighAuthFailureRate
+        expr: rate(poker_requests_total{route="/api/v1/auth/login",status="401"}[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "登录失败率过高"
+          description: "可能有暴力破解尝试"
+
+      # 注册失败率过高
+      - alert: PokerHighRegistrationFailureRate
+        expr: rate(poker_requests_total{route="/api/v1/auth/register",status="429"}[5m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "注册请求被限流"
+          description: "可能有滥用注册"
+
+# Grafana Dashboard JSON
+# 导入到 Grafana 的 dashboard
+{
+  "dashboard": {
+    "title": "Poker Server Monitoring",
+    "uid": "poker-server",
+    "panels": [
+      {
+        "title": "服务状态",
+        "type": "stat",
+        "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+        "targets": [
+          {"expr": "up{job='poker-server'}", "legendFormat": "状态"}
+        ]
+      },
+      {
+        "title": "请求速率",
+        "type": "graph",
+        "gridPos": {"x": 6, "y": 0, "w": 12, "h": 8},
+        "targets": [
+          {"expr": "rate(poker_requests_total[5m])", "legendFormat": "{{route}}"}
+        ]
+      },
+      {
+        "title": "响应时间",
+        "type": "graph",
+        "gridPos": {"x": 18, "y": 0, "w": 6, "h": 8},
+        "targets": [
+          {"expr": "poker_response_time_avg", "legendFormat": "平均"}
+        ]
+      },
+      {
+        "title": "活跃游戏数",
+        "type": "stat",
+        "gridPos": {"x": 0, "y": 4, "w": 6, "h": 4},
+        "targets": [
+          {"expr": "poker_games_active", "legendFormat": "活跃游戏"}
+        ]
+      },
+      {
+        "title": "连接数",
+        "type": "stat",
+        "gridPos": {"x": 6, "y": 4, "w": 6, "h": 4},
+        "targets": [
+          {"expr": "poker_connections_socket", "legendFormat": "Socket 连接"}
+        ]
+      },
+      {
+        "title": "内存使用",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+        "targets": [
+          {"expr": "poker_memory_usage_bytes", "legendFormat": "{{type}}"}
+        ]
+      }
+    ]
+  }
+}

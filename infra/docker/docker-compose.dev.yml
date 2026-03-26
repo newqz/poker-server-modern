@@ -1,0 +1,95 @@
+version: '3.8'
+
+services:
+  # 后端API服务
+  server:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.server
+    container_name: poker-server
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/poker?schema=public
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=dev-secret-key-change-in-production
+      - JWT_REFRESH_SECRET=dev-refresh-secret-change-in-production
+      - LOG_LEVEL=debug
+    volumes:
+      - ../../apps/server/src:/app/apps/server/src
+      - ../../packages:/app/packages
+      - /app/node_modules
+    depends_on:
+      - postgres
+      - redis
+    command: npm run dev --workspace=@poker/server
+    networks:
+      - poker-network
+
+  # 前端开发服务器
+  web:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.web
+    container_name: poker-web
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:3000
+      - VITE_WS_URL=ws://localhost:3000
+    volumes:
+      - ../../apps/web/src:/app/apps/web/src
+      - ../../packages:/app/packages
+      - /app/node_modules
+    command: npm run dev --workspace=@poker/web
+    networks:
+      - poker-network
+
+  # PostgreSQL数据库
+  postgres:
+    image: postgres:16-alpine
+    container_name: poker-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=poker
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - poker-network
+
+  # Redis缓存
+  redis:
+    image: redis:7-alpine
+    container_name: poker-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - poker-network
+
+  # Redis Commander (Redis管理界面)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: poker-redis-commander
+    ports:
+      - "8081:8081"
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    depends_on:
+      - redis
+    networks:
+      - poker-network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  poker-network:
+    driver: bridge
