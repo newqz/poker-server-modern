@@ -26,6 +26,27 @@ export default {
         sans: ['Inter', 'system-ui', 'sans-serif'],
         mono: ['JetBrains Mono', 'monospace'],
       },
+      // mobile-first 断点 (Tailwind 默认值，显式声明便于维护)
+      screens: {
+        'xs': '375px',
+        'sm': '640px',
+        'md': '768px',
+        'lg': '1024px',
+        'xl': '1280px',
+        '2xl': '1536px',
+      },
+      // 触摸友好的最小尺寸
+      minWidth: {
+        'touch': '48px',
+      },
+      minHeight: {
+        'touch': '48px',
+      },
+      // 安全区域间距（用于全面屏手机）
+      spacing: {
+        'safe-b': 'env(safe-area-inset-bottom, 0px)',
+        'safe-t': 'env(safe-area-inset-top, 0px)',
+      },
       animation: {
         'deal': 'deal 0.3s ease-out',
         'flip': 'flip 0.5s ease-in-out',
