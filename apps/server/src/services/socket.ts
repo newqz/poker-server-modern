@@ -1,9 +1,13 @@
 /**
  * Socket.io 服务
  * @module services/socket
- * @author ARCH
- * @date 2026-03-26
- * @task BE-003
+ * @description Socket.io 实时通信处理，支持多实例部署
+ * 
+ * 多实例支持说明：
+ * - 使用 Redis 作为 pub/sub 适配器（已在 server.ts 配置）
+ * - 用户 socket 映射存储在 Redis 中（支持跨实例查找）
+ * - 断线玩家信息存储在 Redis 中（支持跨实例重连检测）
+ * - 操作超时使用 Redis keys with TTL
  */
 
 import type { Server, Socket } from 'socket.io';
@@ -15,52 +19,128 @@ import { escapeHtml } from '../utils/serialize';
 import { GameService } from './game';
 import { auditService } from './audit';
 
-const prisma = new PrismaClient();
-const gameService = new GameService();
+// Redis 客户端（用于跨实例共享状态）
+let redisClient: any = null;
 
-// 存储用户 socket 映射（支持多设备）
-const userSockets = new Map<string, Set<string>>(); // userId -> Set<socketId>
+async function getRedisClient() {
+  if (!redisClient && process.env.REDIS_URL) {
+    try {
+      const { createClient } = require('redis');
+      const url = process.env.REDIS_URL;
+      redisClient = createClient({ url });
+      await redisClient.connect();
+      logger.info('Socket service: Redis connected for shared state');
+    } catch (error) {
+      logger.warn({ error }, 'Socket service: Redis not available, using in-memory fallback');
+    }
+  }
+  return redisClient;
+}
+
+// 本地 socket 映射（用于当前实例）
+const localUserSockets = new Map<string, Set<string>>();
 
 // 连接限流：每个IP最大连接数
 const connectionLimits = new Map<string, { count: number; resetAt: number }>();
-const MAX_CONNECTIONS_PER_IP = 5;
-const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1分钟
+const MAX_CONNECTIONS_PER_IP = 10;
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 
-// 断线玩家缓存：userId -> { socketId, disconnectTime, roomId, gameId, timer }
-const disconnectedPlayers = new Map<string, { 
-  socketId: string; 
-  disconnectTime: number; 
-  roomId?: string; 
-  gameId?: string;
-  timer?: NodeJS.Timeout;
-}>();
-const RECONNECT_TIMEOUT_MS = 60 * 1000; // 60秒内可重连
-
-// 玩家操作超时：gameId -> { playerId -> timeoutId }
+// 本地操作超时（每个实例独立管理）
 const playerActionTimeouts = new Map<string, Map<string, NodeJS.Timeout>>();
 
+// 初始化 Redis 客户端
+getRedisClient();
+
 /**
- * 获取用户的所有 socket ID
+ * 获取用户的所有 socket ID（跨实例）
  */
-function getUserSocketIds(userId: string): string[] {
-  const socketSet = userSockets.get(userId);
+async function getUserSocketIds(userId: string): Promise<string[]> {
+  const redis = await getRedisClient();
+  
+  if (redis) {
+    try {
+      const socketIds = await redis.sMembers(`user_sockets:${userId}`);
+      return socketIds || [];
+    } catch (error) {
+      logger.warn({ error, userId }, 'Redis error getting user sockets, using local fallback');
+    }
+  }
+  
+  // 回退到本地映射
+  const socketSet = localUserSockets.get(userId);
   return socketSet ? Array.from(socketSet) : [];
+}
+
+/**
+ * 添加用户 socket 映射
+ */
+async function addUserSocket(userId: string, socketId: string): Promise<void> {
+  // 本地映射
+  if (!localUserSockets.has(userId)) {
+    localUserSockets.set(userId, new Set());
+  }
+  localUserSockets.get(userId)!.add(socketId);
+  
+  // Redis 映射（跨实例共享）
+  const redis = await getRedisClient();
+  if (redis) {
+    try {
+      await redis.sAdd(`user_sockets:${userId}`, socketId);
+      await redis.expire(`user_sockets:${userId}`, 86400); // 24小时过期
+    } catch (error) {
+      logger.warn({ error, userId, socketId }, 'Redis error adding user socket');
+    }
+  }
+}
+
+/**
+ * 移除用户 socket 映射
+ */
+async function removeUserSocket(userId: string, socketId: string): Promise<void> {
+  // 本地映射
+  const socketSet = localUserSockets.get(userId);
+  if (socketSet) {
+    socketSet.delete(socketId);
+    if (socketSet.size === 0) {
+      localUserSockets.delete(userId);
+    }
+  }
+  
+  // Redis 映射
+  const redis = await getRedisClient();
+  if (redis) {
+    try {
+      await redis.sRem(`user_sockets:${userId}`, socketId);
+    } catch (error) {
+      logger.warn({ error, userId, socketId }, 'Redis error removing user socket');
+    }
+  }
 }
 
 /**
  * 向用户的第一个可用 socket 发送消息（用于通知类消息）
  */
-function emitToUserSocket(io: Server, userId: string, event: string, data: any): void {
-  const socketIds = getUserSocketIds(userId);
+async function emitToUserSocket(io: Server, userId: string, event: string, data: any): Promise<void> {
+  const socketIds = await getUserSocketIds(userId);
+  
   if (socketIds.length > 0) {
     // 只向第一个活跃 socket 发送（游戏中每个用户只用一个设备）
+    // Socket.io 会自动处理跨实例消息（通过 Redis adapter）
     io.to(socketIds[0]).emit(event, data);
+    
+    // 如果有 Redis，记录发送历史用于调试
+    const redis = await getRedisClient();
+    if (redis) {
+      await redis.lPush(`user_events:${userId}`, JSON.stringify({ event, data, ts: Date.now() }));
+      await redis.lTrim(`user_events:${userId}`, 0, 99); // 只保留最近100条
+    }
+  } else {
+    logger.debug({ userId, event }, 'No socket found for user');
   }
 }
 
 /**
  * 设置玩家操作超时
- * 超时后自动弃牌
  */
 function setPlayerActionTimeout(
   io: Server,
@@ -69,35 +149,24 @@ function setPlayerActionTimeout(
   playerId: string,
   timeoutSeconds: number
 ): void {
-  // 清除之前的超时（如果有）
+  // 清除之前的超时
   clearPlayerActionTimeout(gameId, playerId);
   
-  // 获取当前游戏状态
-  const gameState = gameService.getGameState(gameId);
-  if (!gameState) return;
-  
-  // 创建超时定时器
   const timer = setTimeout(async () => {
     try {
-      // 检查玩家是否还在当前回合
-      const currentState = gameService.getGameState(gameId);
-      // 注意：这里检查玩家是否还是当前行动者需要更复杂的逻辑
-      // 简化处理：如果游戏状态存在就继续
-      if (!currentState) {
-        // 玩家已经不是当前行动者，无需处理
-        return;
-      }
+      const gameState = gameService.getGameState(gameId);
+      if (!gameState) return;
       
       // 执行自动弃牌
       const result = await gameService.processAction(gameId, playerId, 'fold');
       
-      // 广播动作
+      // 广播动作（使用 Redis adapter 确保跨实例）
       io.to(roomId).emit(ServerEvents.PLAYER_ACTION, {
         userId: playerId,
         username: 'System',
         action: 'fold',
         amount: 0,
-        autoAction: true  // 标记为自动动作
+        autoAction: true
       });
 
       // 广播更新后的状态
@@ -105,7 +174,7 @@ function setPlayerActionTimeout(
       
       // 通知下一位玩家
       if (result.nextPlayerId) {
-        emitToUserSocket(io, result.nextPlayerId, ServerEvents.YOUR_TURN, {
+        await emitToUserSocket(io, result.nextPlayerId, ServerEvents.YOUR_TURN, {
           gameId,
           timeout: 30
         });
@@ -118,11 +187,23 @@ function setPlayerActionTimeout(
     }
   }, timeoutSeconds * 1000);
   
-  // 存储定时器
+  // 存储定时器（本地）
   if (!playerActionTimeouts.has(gameId)) {
     playerActionTimeouts.set(gameId, new Map());
   }
   playerActionTimeouts.get(gameId)!.set(playerId, timer);
+  
+  // 同时存储到 Redis（用于多实例协调）
+  const redis = await getRedisClient();
+  if (redis) {
+    try {
+      await redis.set(`action_timeout:${gameId}:${playerId}`, Date.now().toString(), {
+        EX: timeoutSeconds + 10
+      });
+    } catch (error) {
+      logger.warn({ error, gameId, playerId }, 'Redis error storing action timeout');
+    }
+  }
 }
 
 /**
@@ -137,41 +218,33 @@ function clearPlayerActionTimeout(gameId: string, playerId: string): void {
       gameTimeouts.delete(playerId);
     }
   }
+  
+  // 清除 Redis 中的记录
+  const redis = getRedisClient() as any;
+  if (redis) {
+    redis.del(`action_timeout:${gameId}:${playerId}`).catch(() => {});
+  }
 }
 
 /**
  * 过滤游戏状态，只向指定玩家暴露允许看到的信息
- * - 手牌只发送给对应玩家
- * - 其他玩家的手牌显示为 undefined
- * - 公共牌对所有玩家可见
  */
 function filterGameStateForPlayer(state: any, targetUserId: string): any {
   if (!state) return null;
 
   const filteredPlayers = state.players?.map((player: any) => {
-    // 如果是自己，只显示自己的手牌
     if (player.userId === targetUserId) {
-      return {
-        ...player,
-        holeCards: player.holeCards
-      };
+      return { ...player, holeCards: player.holeCards };
     }
-    // 其他玩家，隐藏手牌
-    return {
-      ...player,
-      holeCards: undefined
-    };
+    return { ...player, holeCards: undefined };
   }) || [];
 
-  return {
-    ...state,
-    players: filteredPlayers
-  };
+  return { ...state, players: filteredPlayers };
 }
 
 /**
  * 向房间内所有玩家广播过滤后的游戏状态
- * 每个玩家只收到自己应该看到的信息
+ * 使用 Socket.io 的 Redis Adapter 确保跨实例广播
  */
 async function broadcastFilteredGameState(
   io: Server,
@@ -180,28 +253,22 @@ async function broadcastFilteredGameState(
   state: any,
   excludeUserId?: string
 ): Promise<void> {
-  // 获取房间内所有 socket
+  // 使用 Socket.io rooms API 获取房间内所有 socket
+  // Redis adapter 会自动处理跨实例
   const sockets = await io.in(roomId).fetchSockets();
   
   for (const socket of sockets) {
-    // RemoteSocket uses socket.data.userId
-    const socketUserId = (socket as any).userId || socket.data?.userId;
+    const socketAny = socket as any;
+    const socketUserId = socketAny.userId || socket.data?.userId;
     
-    // 跳过排除的用户
     if (excludeUserId && socketUserId === excludeUserId) {
       continue;
     }
     
     if (!socketUserId) continue;
     
-    // 过滤状态
     const filteredState = filterGameStateForPlayer(state, socketUserId);
-    
-    // 只发送到对应 socket
-    socket.emit(ServerEvents.GAME_STATE_UPDATE, {
-      gameId,
-      state: filteredState
-    });
+    socket.emit(ServerEvents.GAME_STATE_UPDATE, { gameId, state: filteredState });
   }
 }
 
@@ -250,7 +317,6 @@ export function setupSocketHandlers(io: Server): void {
       const decoded = jwt.verify(token, process.env.JWT_SECRET!) as { userId: string };
       socket.userId = decoded.userId;
       
-      // 获取用户信息
       const user = await prisma.user.findUnique({
         where: { id: decoded.userId },
         select: { id: true, username: true }
@@ -262,29 +328,27 @@ export function setupSocketHandlers(io: Server): void {
 
       socket.username = user.username;
       
-      // 支持多设备登录：使用 Set 存储多个 socketId
-      if (!userSockets.has(user.id)) {
-        userSockets.set(user.id, new Set());
-      }
-      userSockets.get(user.id)!.add(socket.id);
+      // 添加到用户 socket 映射（支持多设备）
+      await addUserSocket(user.id, socket.id);
       
-      // 检查是否有断线记录，如果有则清除（重连成功）
-      const disconnected = disconnectedPlayers.get(user.id);
-      if (disconnected) {
-        // 清除断线超时定时器
-        if (disconnected.timer) {
-          clearTimeout(disconnected.timer);
-        }
-        // 清除断线记录
-        disconnectedPlayers.delete(user.id);
-        logger.info({ userId: user.id }, 'User reconnected within timeout window');
+      // 检查 Redis 中是否有断线记录
+      const redis = await getRedisClient();
+      if (redis) {
+        const disconnectedKey = `disconnected:${user.id}`;
+        const disconnected = await redis.get(disconnectedKey);
         
-        // 广播重连成功
-        if (disconnected.roomId) {
-          io.to(disconnected.roomId).emit('player_reconnected', {
-            userId: user.id,
-            seatNumber: disconnected.roomId // 简化：使用 roomId 作为座位标识
-          });
+        if (disconnected) {
+          const data = JSON.parse(disconnected);
+          // 清除断线记录
+          await redis.del(disconnectedKey);
+          logger.info({ userId: user.id, previousRoom: data.roomId }, 'User reconnected within timeout window');
+          
+          // 广播重连成功
+          if (data.roomId) {
+            io.to(data.roomId).emit('player_reconnected', {
+              userId: user.id
+            });
+          }
         }
       }
       
@@ -301,7 +365,6 @@ export function setupSocketHandlers(io: Server): void {
       username: socket.username
     }, 'User connected');
 
-    // 发送连接成功事件
     socket.emit(ServerEvents.AUTH_SUCCESS, {
       userId: socket.userId,
       username: socket.username
@@ -334,10 +397,8 @@ export function setupSocketHandlers(io: Server): void {
         
         socket.join(result.roomId);
         
-        // 通知自己加入成功
         socket.emit(ServerEvents.ROOM_JOINED, result);
         
-        // 广播给其他玩家
         socket.to(result.roomId).emit(ServerEvents.PLAYER_JOINED, {
           userId: socket.userId,
           username: socket.username,
@@ -359,19 +420,16 @@ export function setupSocketHandlers(io: Server): void {
         const { roomId } = data;
         const result = await gameService.playerReady(roomId, socket.userId);
         
-        // 广播准备状态
         io.to(roomId).emit('player_ready', {
           userId: socket.userId,
           isReady: true
         });
 
-        // 如果所有玩家都准备好，开始游戏
         if (result.canStart) {
           io.to(roomId).emit('game_starting', { countdown: 5 });
           
           setTimeout(async () => {
             const game = await gameService.startGame(roomId);
-            // 向房间内每个玩家单独发送过滤后的游戏状态
             await broadcastFilteredGameState(io, roomId, game.id, game.state);
             io.to(roomId).emit(ServerEvents.GAME_STARTED, { gameId: game.id });
           }, 5000);
@@ -391,24 +449,18 @@ export function setupSocketHandlers(io: Server): void {
         
         const { gameId, action, amount } = data;
         
-        // 清除该玩家的操作超时
         clearPlayerActionTimeout(gameId, socket.userId);
         
         const result = await gameService.processAction(gameId, socket.userId, action, amount);
         
-        // 审计日志：记录游戏动作
         await auditService.logGameAction(
-          {
-            userId: socket.userId,
-            ipAddress: socket.handshake.address
-          },
+          { userId: socket.userId, ipAddress: socket.handshake.address },
           gameId,
           socket.userId,
           action,
           amount
         );
         
-        // 广播动作（只包含动作类型，不泄露状态）
         io.to(result.roomId).emit(ServerEvents.PLAYER_ACTION, {
           userId: socket.userId,
           username: socket.username,
@@ -416,23 +468,19 @@ export function setupSocketHandlers(io: Server): void {
           amount
         });
 
-        // 向每个玩家单独发送过滤后的游戏状态
         await broadcastFilteredGameState(
           io,
           result.roomId,
           gameId,
           result.gameState,
-          socket.userId  // 排除动作发起者，由自己处理
+          socket.userId
         );
 
-        // 通知下一位玩家
         if (result.nextPlayerId) {
-          emitToUserSocket(io, result.nextPlayerId, ServerEvents.YOUR_TURN, {
+          await emitToUserSocket(io, result.nextPlayerId, ServerEvents.YOUR_TURN, {
             gameId,
             timeout: 30
           });
-          
-          // 设置操作超时（30秒后自动弃牌）
           setPlayerActionTimeout(io, gameId, result.roomId, result.nextPlayerId, 30);
         }
       } catch (error: any) {
@@ -449,11 +497,8 @@ export function setupSocketHandlers(io: Server): void {
         if (!socket.userId || !socket.username) return;
         
         const { roomId, message } = data;
-        
-        // 转义 HTML 防止 XSS
         const safeMessage = escapeHtml(message).slice(0, 500);
         
-        // 保存消息
         await prisma.chatMessage.create({
           data: {
             roomId,
@@ -462,7 +507,6 @@ export function setupSocketHandlers(io: Server): void {
           }
         });
 
-        // 广播消息
         io.to(roomId).emit(ServerEvents.CHAT_MESSAGE, {
           userId: socket.userId,
           username: socket.username,
@@ -487,8 +531,7 @@ export function setupSocketHandlers(io: Server): void {
         
         socket.leave(roomId);
         
-        // 广播离开
-        socket.to(roomId).emit(ServerEvents.PLAYER_LEFT, {
+        io.to(roomId).emit(ServerEvents.PLAYER_LEFT, {
           userId: socket.userId,
           reason: 'left'
         });
@@ -499,60 +542,71 @@ export function setupSocketHandlers(io: Server): void {
 
     // 断开连接
     socket.on('disconnect', async () => {
-      logger.info({
-        socketId: socket.id,
-        userId: socket.userId
-      }, 'User disconnected');
+      logger.info({ socketId: socket.id, userId: socket.userId }, 'User disconnected');
 
-      if (!socket.userId) {
-        return; // 未认证的连接不做处理
-      }
+      if (!socket.userId) return;
 
-      // 从用户socket集合中移除
-      const socketSet = userSockets.get(socket.userId);
-      if (socketSet) {
-        socketSet.delete(socket.id);
-        if (socketSet.size === 0) {
-          userSockets.delete(socket.userId);
-        }
-      }
+      await removeUserSocket(socket.userId, socket.id);
 
-      // 检查是否还有其他活跃连接（多设备）
-      if (socketSet && socketSet.size > 0) {
-        logger.info({ userId: socket.userId, remainingConnections: socketSet.size }, 'User has other active connections');
+      // 检查是否还有其他活跃连接
+      const remainingSockets = await getUserSocketIds(socket.userId);
+      if (remainingSockets.length > 0) {
+        logger.info({ 
+          userId: socket.userId, 
+          remainingConnections: remainingSockets.length 
+        }, 'User has other active connections');
         return;
       }
 
-      // 查找当前所在的房间/游戏
+      // 查找当前房间
       let roomId: string | undefined;
       let gameId: string | undefined;
-      const rooms = Array.from(socket.rooms);
-      for (const r of rooms) {
-        if (r !== socket.id) {
-          const state = gameService.getGameState(r);
-          if (state) {
-            roomId = r;
-            gameId = state.id;
+      
+      // 尝试从 Redis 获取断线信息
+      const redis = await getRedisClient();
+      if (redis) {
+        // 查找用户所在的房间
+        const roomKeys = await redis.keys(`room:*:players`);
+        for (const key of roomKeys) {
+          const isMember = await redis.sIsMember(key, socket.userId);
+          if (isMember) {
+            roomId = key.split(':')[1];
+            const state = gameService.getGameState(roomId);
+            if (state) gameId = state.id;
             break;
           }
         }
       }
 
-      // 记录断线信息，设置重连超时
-      const timer = setTimeout(async () => {
-        const stored = disconnectedPlayers.get(socket.userId!);
-        if (stored && stored.socketId === socket.id) {
-          // 超时：玩家确实断线了
-          disconnectedPlayers.delete(socket.userId!);
-          
-          if (roomId) {
-            // 游戏进行中：执行自动弃牌
-            if (gameId) {
+      // 设置断线超时（使用 Redis 确保跨实例）
+      if (redis && roomId) {
+        await redis.set(`disconnected:${socket.userId}`, JSON.stringify({
+          socketId: socket.id,
+          roomId,
+          gameId,
+          disconnectTime: Date.now()
+        }), { EX: 60 }); // 60秒过期
+        
+        // 广播断线（给其他实例处理的机会）
+        io.to(roomId).emit('player_disconnected', {
+          userId: socket.userId,
+          reason: 'disconnect'
+        });
+        
+        // 设置60秒后检查，如果仍未重连则自动处理
+        setTimeout(async () => {
+          const stillDisconnected = await redis.get(`disconnected:${socket.userId}`);
+          if (stillDisconnected) {
+            const data = JSON.parse(stillDisconnected);
+            
+            if (roomId && gameId) {
               try {
                 const gameState = gameService.getGameState(gameId);
                 if (gameState) {
-                  // 检查该用户是否在当前游戏中
-                  const playerInGame = gameState.players?.some((p: any) => p.userId === socket.userId);
+                  const playerInGame = gameState.players?.some(
+                    (p: any) => p.userId === socket.userId
+                  );
+                  
                   if (playerInGame) {
                     const result = await gameService.processAction(gameId, socket.userId!, 'fold');
                     
@@ -566,20 +620,17 @@ export function setupSocketHandlers(io: Server): void {
                     
                     await broadcastFilteredGameState(io, roomId, gameId, result.gameState);
                     
-                    // 通知下一位玩家
                     if (result.nextPlayerId) {
-                      emitToUserSocket(io, result.nextPlayerId, ServerEvents.YOUR_TURN, {
+                      await emitToUserSocket(io, result.nextPlayerId, ServerEvents.YOUR_TURN, {
                         gameId,
                         timeout: 30
                       });
                       setPlayerActionTimeout(io, gameId, roomId, result.nextPlayerId, 30);
                     }
-                    
-                    logger.info({ userId: socket.userId, gameId }, 'Player auto-folded due to disconnect timeout');
                   }
                 }
               } catch (error) {
-                logger.error({ userId: socket.userId, gameId, error }, 'Error in auto-fold');
+                logger.error({ userId: socket.userId, gameId, error }, 'Auto-fold error');
               }
             }
             
@@ -588,25 +639,7 @@ export function setupSocketHandlers(io: Server): void {
               reason: 'timeout'
             });
           }
-          
-          logger.info({ userId: socket.userId }, 'Player disconnected timeout expired');
-        }
-      }, RECONNECT_TIMEOUT_MS);
-
-      disconnectedPlayers.set(socket.userId, {
-        socketId: socket.id,
-        disconnectTime: Date.now(),
-        roomId,
-        gameId,
-        timer
-      });
-
-      // 广播玩家断线
-      if (roomId) {
-        io.to(roomId).emit('player_disconnected', {
-          userId: socket.userId,
-          reason: 'disconnect'
-        });
+        }, 60000);
       }
     });
   });
