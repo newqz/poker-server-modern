@@ -1,10 +1,10 @@
 /**
- * 扑克牌组件 - 响应式多尺寸
+ * 扑克牌组件 - 增强视觉效果
  * @component PlayingCard
  * @author ARCH
  * @date 2026-03-26
  * @task FE-001
- * @updated 2026-03-28 - 新增 xs 尺寸，支持响应式缩放
+ * @updated 2026-04-03 - 视觉增强版本
  */
 
 import { Card } from '@poker/shared'
@@ -15,40 +15,29 @@ interface PlayingCardProps {
   card?: Card
   hidden?: boolean
   size?: CardSize
-  /** 启用响应式尺寸：xs -> sm:sm -> md:md -> lg:lg */
   responsive?: boolean
   className?: string
 }
 
 const sizeClasses: Record<CardSize, string> = {
-  xs: 'w-6 h-9 text-[10px]',        // 24x36 - 手机小屏
-  sm: 'w-8 h-12 text-xs',            // 32x48 - 手机
-  md: 'w-12 h-[72px] text-base',     // 48x72 - 平板
-  lg: 'w-16 h-24 text-xl',           // 64x96 - 桌面
+  xs: 'w-8 h-12 text-[8px]',
+  sm: 'w-10 h-14 text-xs',
+  md: 'w-14 h-20 text-sm',
+  lg: 'w-20 h-28 text-base',
 }
 
-/** 响应式尺寸：mobile-first 自适应断点 */
-const responsiveClasses = 'w-6 h-9 text-[10px] sm:w-8 sm:h-12 sm:text-xs md:w-12 md:h-[72px] md:text-base lg:w-16 lg:h-24 lg:text-xl'
+const responsiveClasses = 'w-10 h-14 text-xs sm:w-12 sm:h-16 sm:text-sm md:w-14 md:h-20 md:text-base lg:w-20 lg:h-28 lg:text-base'
 
-/** 响应式牌背装饰尺寸 */
-const backDecoSizeClasses: Record<CardSize, string> = {
-  xs: 'w-4 h-5',
-  sm: 'w-5 h-6',
-  md: 'w-8 h-10',
-  lg: 'w-10 h-12',
-}
-
-const responsiveBackDecoClasses = 'w-4 h-5 sm:w-5 sm:h-6 md:w-8 md:h-10 lg:w-10 lg:h-12'
-
-/** 花色符号显示尺寸 */
-const suitFontClasses: Record<CardSize, string> = {
-  xs: 'text-xs',
-  sm: 'text-sm',
-  md: 'text-xl',
-  lg: 'text-2xl',
-}
-
-const responsiveSuitFontClasses = 'text-xs sm:text-sm md:text-xl lg:text-2xl'
+/** 牌背图案 */
+const CARD_BACK_PATTER = `
+  repeating-linear-gradient(
+    45deg,
+    transparent,
+    transparent 2px,
+    rgba(59, 130, 246, 0.15) 2px,
+    rgba(59, 130, 246, 0.15) 4px
+  )
+`
 
 export function PlayingCard({
   card,
@@ -58,15 +47,17 @@ export function PlayingCard({
   className = '',
 }: PlayingCardProps) {
   const cardSizeClass = responsive ? responsiveClasses : sizeClasses[size]
-  const backDecoClass = responsive ? responsiveBackDecoClasses : backDecoSizeClasses[size]
-  const suitFontClass = responsive ? responsiveSuitFontClasses : suitFontClasses[size]
 
   if (hidden || !card) {
     return (
       <div
-        className={`${cardSizeClass} bg-blue-800 rounded-md sm:rounded-lg shadow-lg flex items-center justify-center flex-shrink-0 ${className}`}
+        className={`${cardSizeClass} rounded-lg shadow-xl flex items-center justify-center flex-shrink-0 bg-gradient-to-br from-blue-700 via-blue-800 to-blue-900 border-2 border-blue-500/30 hover:scale-105 transition-transform cursor-pointer ${className}`}
+        style={{ backgroundImage: CARD_BACK_PATTER }}
       >
-        <div className={`${backDecoClass} border-2 border-blue-600 rounded`}></div>
+        {/* 中心装饰 */}
+        <div className="w-6 h-8 sm:w-8 sm:h-10 md:w-10 md:h-14 border-2 border-blue-400/40 rounded-md flex items-center justify-center">
+          <span className="text-blue-300 text-xs sm:text-sm md:text-lg font-bold">PK</span>
+        </div>
       </div>
     )
   }
@@ -75,28 +66,63 @@ export function PlayingCard({
   const suit = card[1]
 
   const suitSymbols: Record<string, string> = {
-    s: '♠',
-    h: '♥',
-    d: '♦',
-    c: '♣',
+    spade: '♠',
+    heart: '♥',
+    diamond: '♦',
+    club: '♣',
   }
 
   const suitColors: Record<string, string> = {
-    s: 'text-black',
-    h: 'text-red-500',
-    d: 'text-red-500',
-    c: 'text-black',
+    spade: 'text-gray-900',
+    heart: 'text-red-500',
+    diamond: 'text-red-500',
+    club: 'text-gray-900',
+  }
+
+  const suitBgColors: Record<string, string> = {
+    spade: 'bg-gray-900',
+    heart: 'bg-red-500',
+    diamond: 'bg-red-500',
+    club: 'bg-gray-900',
   }
 
   const rankDisplay = rank === 'T' ? '10' : rank
+  const suitName = card.suit?.toLowerCase().charAt(0) || 
+                   (card.display?.includes('♠') ? 'spade' : 
+                    card.display?.includes('♥') ? 'heart' :
+                    card.display?.includes('♦') ? 'diamond' : 'club')
 
   return (
     <div
-      className={`${cardSizeClass} bg-white rounded-md sm:rounded-lg shadow-lg flex flex-col items-center justify-between p-0.5 sm:p-1 ${suitColors[suit]} flex-shrink-0 ${className}`}
+      className={`${cardSizeClass} rounded-lg shadow-xl flex flex-col items-center justify-between p-1 sm:p-1.5 bg-gradient-to-br from-white via-gray-50 to-gray-100 border border-gray-200 flex-shrink-0 hover:scale-105 hover:shadow-2xl transition-all duration-200 ${className}`}
     >
-      <span className="font-bold leading-none">{rankDisplay}</span>
-      <span className={`${suitFontClass} leading-none`}>{suitSymbols[suit]}</span>
-      <span className="font-bold leading-none rotate-180">{rankDisplay}</span>
+      {/* 左上角 */}
+      <div className="flex flex-col items-center self-start">
+        <span className={`font-black leading-none ${suitColors[suitName]} text-[10px] sm:text-xs`}>
+          {rankDisplay}
+        </span>
+        <span className={`${suitColors[suitName]} text-[10px] sm:text-sm leading-none`}>
+          {suitSymbols[suitName]}
+        </span>
+      </div>
+
+      {/* 中央花色 */}
+      <div className={`${suitColors[suitName]} text-xl sm:text-2xl md:text-3xl lg:text-4xl font-black drop-shadow-md`}>
+        {suitSymbols[suitName]}
+      </div>
+
+      {/* 右下角 (旋转180度) */}
+      <div className="flex flex-col items-center self-end rotate-180">
+        <span className={`font-black leading-none ${suitColors[suitName]} text-[10px] sm:text-xs`}>
+          {rankDisplay}
+        </span>
+        <span className={`${suitColors[suitName]} text-[10px] sm:text-sm leading-none`}>
+          {suitSymbols[suitName]}
+        </span>
+      </div>
+
+      {/* 高光效果 */}
+      <div className="absolute inset-0 bg-gradient-to-br from-white/20 via-transparent to-transparent rounded-lg pointer-events-none"></div>
     </div>
   )
 }
