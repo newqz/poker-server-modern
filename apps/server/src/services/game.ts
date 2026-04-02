@@ -12,6 +12,7 @@ import type { Socket } from 'socket.io';
 import { GameEngine, GamePlayer } from '@poker/engine';
 import { generateRoomCode } from '@poker/shared';
 import { logger } from '../utils/logger';
+import { antiCheatService } from './antiCheat';
 
 const prisma = new PrismaClient();
 
@@ -289,6 +290,11 @@ export class GameService {
     // 注意：processAction 现在是 async 方法（使用 Mutex）
     const result = await gameEngine.processAction(userId, action as any, amount);
     const { chipChange } = result;
+
+    // 记录动作用于反作弊检测
+    antiCheatService.recordAction(userId, gameId, action, amount).catch(err => {
+      logger.error({ userId, gameId, error: err }, 'Failed to record action for anti-cheat');
+    });
 
     try {
       // 在事务中处理所有数据库操作

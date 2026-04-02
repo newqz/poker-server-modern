@@ -11,13 +11,15 @@ import { authRouter } from './auth';
 import { roomRouter } from './room';
 import { gameRouter } from './game';
 import { userRouter } from './user';
+import { adminRouter } from './admin';
 import { authenticate } from '../middleware/authenticate';
 import { verifySignature } from '../middleware/requestSignature';
 import {
   defaultRateLimit,
   authRateLimit,
   gameActionRateLimit,
-  searchRateLimit
+  searchRateLimit,
+  strictRateLimit
 } from '../middleware/rateLimit';
 
 export function setupRoutes(app: Application): void {
@@ -38,6 +40,9 @@ export function setupRoutes(app: Application): void {
 
   // 用户路由 - 需要认证
   app.use(`${API_PREFIX}/users`, authenticate, userRouter);
+
+  // 管理后台路由 - 需要认证 + 严格限流
+  app.use(`${API_PREFIX}/admin`, strictRateLimit, authenticate, adminRouter);
 
   // 404 处理 - 不暴露内部路径信息
   app.use((req, res) => {
