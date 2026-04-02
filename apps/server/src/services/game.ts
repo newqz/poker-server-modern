@@ -264,6 +264,8 @@ export class GameService {
   /**
    * 处理玩家动作
    * 筹码变动在数据库事务中完成，确保原子性
+   * 
+   * 注意：processAction 现在是 async 方法，使用 Mutex 确保线程安全
    */
   async processAction(
     gameId: string,
@@ -273,7 +275,7 @@ export class GameService {
   ) {
     const gameEngine = activeGames.get(gameId);
     if (!gameEngine) {
-      throw new Error('Game not found');
+      throw new Error('GAME_NOT_FOUND');
     }
 
     // 获取当前状态（用于获取游戏轮次信息）
@@ -284,7 +286,8 @@ export class GameService {
     gameEngine.saveSnapshotForRollback();
 
     // 执行游戏逻辑，获取筹码变动明细
-    const result = gameEngine.processAction(userId, action as any, amount);
+    // 注意：processAction 现在是 async 方法（使用 Mutex）
+    const result = await gameEngine.processAction(userId, action as any, amount);
     const { chipChange } = result;
 
     try {

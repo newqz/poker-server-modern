@@ -9,12 +9,14 @@
     "dev": "tsc --watch",
     "test": "vitest",
     "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "lint": "eslint . --ext .ts",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist"
   },
   "dependencies": {
     "@poker/shared": "*",
+    "async-mutex": "^0.5.0",
     "pokersolver": "^2.1.4"
   },
   "devDependencies": {

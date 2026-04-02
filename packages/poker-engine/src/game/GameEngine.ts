@@ -5,6 +5,11 @@
  * @date 2026-03-26
  * @task BE-001
  * @description 德州扑克游戏核心逻辑管理
+ * 
+ * 安全修复 (2026-04-02):
+ * - 使用 async-mutex 替代简单 boolean 作为 actionLock，防止竞态条件
+ * - 添加金额边界检查，防止整数溢出
+ * - 改进错误处理，确保锁正确释放
  */
 
 import type { 
@@ -19,6 +24,48 @@ import { GameStatus as GameStatusEnum, PlayerAction as PlayerActionEnum } from '
 import { Deck } from '../deck/Deck';
 import { HandEvaluator } from '../evaluator/HandEvaluator';
 import { BettingRound, BettingAction } from './BettingRound';
+
+// 引入 Mutex 库
+// 注意：如果没有安装 async-mutex，可以使用简单实现作为后备
+let Mutex: any;
+try {
+  const asyncMutex = require('async-mutex');
+  Mutex = asyncMutex.Mutex;
+} catch (e) {
+  // 后备：使用简单互斥锁实现
+  Mutex = class SimpleMutex {
+    private locked = false;
+    private waitQueue: Array<() => void> = [];
+
+    async acquire(): Promise<() => void> {
+      if (!this.locked) {
+        this.locked = true;
+        return () => {
+          this.release();
+        };
+      }
+      return new Promise((resolve) => {
+        this.waitQueue.push(() => {
+          this.locked = true;
+          resolve(() => this.release());
+        });
+      });
+    }
+
+    release(): void {
+      const next = this.waitQueue.shift();
+      if (next) {
+        next();
+      } else {
+        this.locked = false;
+      }
+    }
+
+    isLocked(): boolean {
+      return this.locked;
+    }
+  };
+}
 
 export interface GamePlayer {
   userId: string;
@@ -76,12 +123,18 @@ export interface ActionResult {
 /**
  * 游戏引擎
  * 管理德州扑克的完整游戏流程
+ * 
+ * 线程安全说明：
+ * - 使用 Mutex 确保 processAction 串行执行
+ * - 所有状态修改必须通过 processAction 进行
+ * - 避免直接修改 state 对象
  */
 export class GameEngine {
   private state: GameState;
   private deck: Deck;
   private config: GameConfig;
-  private actionLock: boolean = false;  // 动作处理锁，防止竞态条件
+  // 修复：使用真正的互斥锁替代简单 boolean
+  private actionMutex: InstanceType<typeof Mutex>;
   private stateSnapshot: GameState | null = null;  // 用于回滚的状态快照
   private readonly ACTIONABLE_STATUSES = new Set([
     GameStatusEnum.PREFLOP,
@@ -89,10 +142,15 @@ export class GameEngine {
     GameStatusEnum.TURN,
     GameStatusEnum.RIVER
   ]);
+  
+  // 安全限制常量
+  private static readonly MAX_AMOUNT = 1000000000; // 10亿，防止整数溢出
+  private static readonly MAX_POT_MULTIPLIER = 1000; // 最大下注额不能超过底池的1000倍
 
   constructor(gameId: string, roomId: string, config: GameConfig) {
     this.config = config;
     this.deck = new Deck();
+    this.actionMutex = new Mutex();
     this.state = {
       id: gameId,
       roomId,
@@ -114,13 +172,13 @@ export class GameEngine {
    */
   addPlayer(userId: string, username: string, seatNumber: number, buyIn: number): void {
     if (this.state.status !== GameStatusEnum.WAITING) {
-      throw new Error('游戏已经开始，无法添加玩家');
+      throw new Error('GAME_ALREADY_STARTED');
     }
 
     // 检查座位是否已被占用
     const existingPlayer = this.state.players.find(p => p.seatNumber === seatNumber);
     if (existingPlayer) {
-      throw new Error(`座位 ${seatNumber} 已被占用`);
+      throw new Error('SEAT_OCCUPIED');
     }
 
     this.state.players.push({
@@ -141,7 +199,7 @@ export class GameEngine {
    */
   start(dealerSeat: number): void {
     if (this.state.players.length < 2) {
-      throw new Error('至少需要2名玩家才能开始游戏');
+      throw new Error('NEED_AT_LEAST_2_PLAYERS');
     }
 
     this.state.status = GameStatusEnum.STARTING;
@@ -171,16 +229,20 @@ export class GameEngine {
 
     if (sbPlayer) {
       const sbAmount = Math.min(this.config.smallBlind, sbPlayer.chips);
-      sbPlayer.chips -= sbAmount;
-      sbPlayer.betAmount = sbAmount;
-      this.state.bettingRound.addToPot(sbAmount, sbPlayer.userId);
+      if (sbAmount > 0) {
+        sbPlayer.chips -= sbAmount;
+        sbPlayer.betAmount = sbAmount;
+        this.state.bettingRound.addToPot(sbAmount, sbPlayer.userId);
+      }
     }
 
     if (bbPlayer) {
       const bbAmount = Math.min(this.config.bigBlind, bbPlayer.chips);
-      bbPlayer.chips -= bbAmount;
-      bbPlayer.betAmount = bbAmount;
-      this.state.bettingRound.addToPot(bbAmount, bbPlayer.userId);
+      if (bbAmount > 0) {
+        bbPlayer.chips -= bbAmount;
+        bbPlayer.betAmount = bbAmount;
+        this.state.bettingRound.addToPot(bbAmount, bbPlayer.userId);
+      }
     }
   }
 
@@ -252,87 +314,87 @@ export class GameEngine {
 
   /**
    * 处理玩家动作
-   * 注意：此方法内部加锁，防止竞态条件
+   * 使用 Mutex 确保线程安全，防止竞态条件
+   * 
    * @returns ActionResult 包含筹码变动明细
    */
-  processAction(playerId: string, action: PlayerAction, amount?: number): ActionResult {
-    // 竞态条件保护：获取锁
-    if (this.actionLock) {
-      throw new Error('GAME_BUSY');
+  async processAction(playerId: string, action: PlayerAction, amount?: number): Promise<ActionResult> {
+    // 获取互斥锁
+    const release = await this.actionMutex.acquire();
+    
+    try {
+      return this.doProcessAction(playerId, action, amount);
+    } finally {
+      // 确保锁被释放
+      release();
     }
-    this.actionLock = true;
+  }
+
+  /**
+   * 实际处理动作的内部方法
+   * 在持有互斥锁时调用
+   */
+  private doProcessAction(playerId: string, action: PlayerAction, amount?: number): ActionResult {
+    const player = this.getPlayerById(playerId);
+    
+    if (!player) {
+      throw new Error('INVALID_PLAYER');
+    }
+
+    // 检查游戏阶段是否接受动作
+    if (!this.ACTIONABLE_STATUSES.has(this.state.status)) {
+      throw new Error('INVALID_PHASE');
+    }
+
+    // 检查是否是自己的回合
+    if (player.seatNumber !== this.state.currentPlayerSeat) {
+      throw new Error('NOT_YOUR_TURN');
+    }
+
+    // 检查是否已弃牌
+    if (player.isFolded) {
+      throw new Error('ALREADY_FOLDED');
+    }
+
+    // 检查是否已全押
+    if (player.isAllIn) {
+      throw new Error('ALREADY_ALL_IN');
+    }
+
+    // 校验金额参数
+    if (amount !== undefined) {
+      const validatedAmount = this.sanitizeAmount(amount);
+      if (validatedAmount <= 0) {
+        throw new Error('INVALID_AMOUNT');
+      }
+      amount = validatedAmount;
+    }
+
+    // 验证动作合法性
+    this.validateAction(player, action, amount);
 
     // 筹码变动记录
     let chipChange = {
       playerId,
       deducted: 0,
       addedToPot: 0,
-      newBalance: 0
+      newBalance: player.chips
     };
 
-    try {
-      const player = this.getPlayerById(playerId);
-      
-      if (!player) {
-        throw new Error('INVALID_PLAYER');
-      }
+    // 执行动作并记录筹码变动
+    switch (action) {
+      case PlayerActionEnum.FOLD:
+        player.isFolded = true;
+        break;
 
-      // 检查游戏阶段是否接受动作
-      if (!this.ACTIONABLE_STATUSES.has(this.state.status)) {
-        throw new Error('INVALID_PHASE');
-      }
+      case PlayerActionEnum.CHECK:
+        // 什么都不做
+        break;
 
-      // 检查是否是自己的回合
-      if (player.seatNumber !== this.state.currentPlayerSeat) {
-        throw new Error('NOT_YOUR_TURN');
-      }
-
-      // 检查是否已弃牌
-      if (player.isFolded) {
-        throw new Error('ALREADY_FOLDED');
-      }
-
-      // 检查是否已全押
-      if (player.isAllIn) {
-        throw new Error('ALREADY_ALL_IN');
-      }
-
-      // 校验金额参数
-      if (amount !== undefined) {
-        const validatedAmount = this.sanitizeAmount(amount);
-        if (validatedAmount <= 0) {
-          throw new Error('INVALID_AMOUNT');
-        }
-        amount = validatedAmount;
-      }
-
-      // 验证动作合法性
-      this.validateAction(player, action, amount);
-
-      // 执行动作并记录筹码变动
-      switch (action) {
-        case PlayerActionEnum.FOLD:
-          player.isFolded = true;
-          chipChange = {
-            playerId,
-            deducted: 0,
-            addedToPot: 0,
-            newBalance: player.chips
-          };
-          break;
-
-        case PlayerActionEnum.CHECK:
-          chipChange = {
-            playerId,
-            deducted: 0,
-            addedToPot: 0,
-            newBalance: player.chips
-          };
-          break;
-
-        case PlayerActionEnum.CALL:
-          const callAmount = this.state.bettingRound.getCurrentBet() - player.betAmount;
-          const actualCall = Math.min(callAmount, player.chips);
+      case PlayerActionEnum.CALL:
+        const callAmount = this.state.bettingRound.getCurrentBet() - player.betAmount;
+        const actualCall = Math.min(callAmount, player.chips);
+        if (actualCall > 0) {
           player.chips -= actualCall;
           player.betAmount += actualCall;
           this.state.bettingRound.addToPot(actualCall, playerId);
@@ -342,14 +404,16 @@ export class GameEngine {
             addedToPot: actualCall,
             newBalance: player.chips
           };
-          break;
+        }
+        break;
 
-        case PlayerActionEnum.RAISE:
-          if (!amount) throw new Error('RAISE_REQUIRES_AMOUNT');
-          const raiseAmount = amount - player.betAmount;
-          if (raiseAmount > player.chips) {
-            throw new Error('INSUFFICIENT_CHIPS');
-          }
+      case PlayerActionEnum.RAISE:
+        if (!amount) throw new Error('RAISE_REQUIRES_AMOUNT');
+        const raiseAmount = amount - player.betAmount;
+        if (raiseAmount > player.chips) {
+          throw new Error('INSUFFICIENT_CHIPS');
+        }
+        if (raiseAmount > 0) {
           player.chips -= raiseAmount;
           player.betAmount = amount;
           this.state.bettingRound.addToPot(raiseAmount, playerId);
@@ -359,10 +423,12 @@ export class GameEngine {
             addedToPot: raiseAmount,
             newBalance: player.chips
           };
-          break;
+        }
+        break;
 
-        case PlayerActionEnum.ALL_IN:
-          const allInAmount = player.chips;
+      case PlayerActionEnum.ALL_IN:
+        const allInAmount = player.chips;
+        if (allInAmount > 0) {
           player.betAmount += allInAmount;
           player.chips = 0;
           player.isAllIn = true;
@@ -378,39 +444,36 @@ export class GameEngine {
           if (player.betAmount > this.state.bettingRound.getCurrentBet()) {
             this.state.bettingRound.recordAction(playerId, action, player.betAmount);
           }
-          break;
-      }
-
-      // 记录动作
-      this.state.bettingRound.recordAction(playerId, action, amount);
-      this.state.lastAction = {
-        playerId,
-        action,
-        amount,
-        timestamp: new Date()
-      };
-
-      // 检查轮次是否结束
-      if (this.isRoundComplete()) {
-        this.advanceToNextRound();
-      } else {
-        this.moveToNextPlayer();
-      }
-
-      // 返回结果
-      const nextPlayer = this.getCurrentPlayer();
-      return {
-        playerId,
-        action,
-        amount,
-        chipChange,
-        newState: this.getState(),
-        nextPlayerId: nextPlayer?.userId
-      };
-    } finally {
-      // 确保释放锁
-      this.actionLock = false;
+        }
+        break;
     }
+
+    // 记录动作
+    this.state.bettingRound.recordAction(playerId, action, amount);
+    this.state.lastAction = {
+      playerId,
+      action,
+      amount,
+      timestamp: new Date()
+    };
+
+    // 检查轮次是否结束
+    if (this.isRoundComplete()) {
+      this.advanceToNextRound();
+    } else {
+      this.moveToNextPlayer();
+    }
+
+    // 返回结果
+    const nextPlayer = this.getCurrentPlayer();
+    return {
+      playerId,
+      action,
+      amount,
+      chipChange,
+      newState: this.getState(),
+      nextPlayerId: nextPlayer?.userId
+    };
   }
 
   /**
@@ -431,8 +494,7 @@ export class GameEngine {
     }
     
     // 检查是否超过最大限制（防止溢出）
-    const MAX_AMOUNT = 1000000000; // 10亿
-    if (validated > MAX_AMOUNT) {
+    if (validated > GameEngine.MAX_AMOUNT) {
       return 0;
     }
     
@@ -445,27 +507,43 @@ export class GameEngine {
   private validateAction(player: GamePlayer, action: PlayerAction, amount?: number): void {
     const currentBet = this.state.bettingRound.getCurrentBet();
     const playerBet = player.betAmount;
+    const currentPot = this.state.pot + this.state.bettingRound.getTotalPot();
 
     switch (action) {
       case PlayerActionEnum.CHECK:
         if (currentBet > playerBet) {
-          throw new Error('有下注时必须跟注或加注，不能过牌');
+          throw new Error('MUST_CALL_OR_FOLD');
         }
         break;
 
       case PlayerActionEnum.CALL:
         if (currentBet <= playerBet) {
-          throw new Error('没有需要跟注的下注');
+          throw new Error('NO_NEED_TO_CALL');
         }
         break;
 
       case PlayerActionEnum.RAISE:
-        if (!amount) throw new Error('加注必须指定金额');
-        if (amount <= currentBet) {
-          throw new Error('加注金额必须大于当前下注');
+        if (!amount) throw new Error('RAISE_REQUIRES_AMOUNT');
+        
+        // 验证下注金额不超过玩家拥有的筹码
+        const totalBet = amount - playerBet;
+        if (totalBet > player.chips) {
+          throw new Error('INSUFFICIENT_CHIPS');
         }
-        if (amount - playerBet > player.chips) {
-          throw new Error('筹码不足以加注到该金额');
+        
+        // 验证下注金额不超过底池的合理倍数（防止过度加注）
+        if (amount > playerBet + currentPot * GameEngine.MAX_POT_MULTIPLIER) {
+          throw new Error('BET_TOO_LARGE');
+        }
+        
+        if (amount <= currentBet) {
+          throw new Error('RAISE_MUST_BE_MORE_THAN_CURRENT_BET');
+        }
+        
+        // 验证最小加注额（必须至少是当前下注额的两倍，或至少加大盲注）
+        const minRaise = Math.max(currentBet * 2, this.config.bigBlind);
+        if (amount < minRaise) {
+          throw new Error('RAISE_TOO_SMALL');
         }
         break;
     }
@@ -476,6 +554,8 @@ export class GameEngine {
    */
   private moveToNextPlayer(): void {
     const activePlayers = this.getActivePlayers();
+    if (activePlayers.length === 0) return;
+    
     const currentIndex = activePlayers.findIndex(p => p.seatNumber === this.state.currentPlayerSeat);
     const nextIndex = (currentIndex + 1) % activePlayers.length;
     this.state.currentPlayerSeat = activePlayers[nextIndex].seatNumber;
@@ -592,7 +672,7 @@ export class GameEngine {
    */
   getPlayerPublicInfo(playerId: string): Omit<GamePlayer, 'holeCards'> {
     const player = this.getPlayerById(playerId);
-    if (!player) throw new Error('玩家不存在');
+    if (!player) throw new Error('PLAYER_NOT_FOUND');
     
     const { holeCards, ...publicInfo } = player;
     return publicInfo;
@@ -603,7 +683,7 @@ export class GameEngine {
    */
   getPlayerHoleCards(playerId: string): Card[] {
     const player = this.getPlayerById(playerId);
-    if (!player) throw new Error('玩家不存在');
+    if (!player) throw new Error('PLAYER_NOT_FOUND');
     return [...player.holeCards];
   }
 
