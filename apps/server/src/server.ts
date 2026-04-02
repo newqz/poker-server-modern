@@ -23,9 +23,21 @@ import { validateEnvironment } from './middleware/startupValidation';
 import { setupRoutes } from './routes';
 import { setupSocketHandlers } from './services/socket';
 import { gameService } from './services/game';
+import { rateLimiter } from './utils/rateLimiter';
 
 // 启动时校验环境变量
 validateEnvironment();
+
+// 初始化分布式速率限制器
+const REDIS_URL = process.env.REDIS_URL?.replace(/\?.*$/, ''); // 移除查询参数
+if (REDIS_URL) {
+  const redisUrlForLimiter = REDIS_URL.startsWith('redis://:') 
+    ? REDIS_URL 
+    : REDIS_URL.replace('redis://', `redis://:${process.env.REDIS_PASSWORD || ''}@`);
+  await rateLimiter.initialize(redisUrlForLimiter);
+} else {
+  await rateLimiter.initialize();
+}
 
 export async function createServer(): Promise<{ app: express.Application; server: http.Server; io: Server }> {
   const app = express();

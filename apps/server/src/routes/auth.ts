@@ -15,6 +15,7 @@ import rateLimit from 'express-rate-limit';
 import { PrismaClient } from '@prisma/client';
 import { logger } from '../utils/logger';
 import { auditService, AuditContext } from '../services/audit';
+import { rateLimiter, LOGIN_RATE_LIMIT, REGISTER_RATE_LIMIT } from '../utils/rateLimiter';
 
 // 登录速率限制：每15分钟最多5次
 const loginLimiter = rateLimit({
@@ -39,76 +40,6 @@ const registerLimiter = rateLimit({
 const router = Router();
 const prisma = new PrismaClient();
 
-// 登录失败尝试追踪
-// 注意：多实例部署时需要使用 Redis。以下实现仅适用于单实例。
-// 生产环境应使用 Redis 实现分布式限流。
-const loginAttempts = new Map<string, { count: number; lockUntil?: number }>();
-const MAX_LOGIN_ATTEMPTS = 5;
-const LOCKOUT_DURATION_MS = 15 * 60 * 1000; // 15分钟
-
-// 注册限流：每个IP每15分钟最多注册3次
-const registerAttempts = new Map<string, { count: number; resetAt: number }>();
-const MAX_REGISTER_ATTEMPTS = 3;
-const REGISTER_LIMIT_WINDOW_MS = 15 * 60 * 1000;
-
-// Redis 客户端（用于生产环境多实例部署）
-let redisClient: any = null;
-
-async function initRedisClient(): Promise<void> {
-  if (process.env.REDIS_URL) {
-    try {
-      const { createClient } = require('redis');
-      redisClient = createClient({ url: process.env.REDIS_URL });
-      await redisClient.connect();
-      logger.info('Redis client connected for rate limiting');
-    } catch (error) {
-      logger.warn({ error }, 'Failed to connect to Redis, using in-memory rate limiting');
-    }
-  }
-}
-
-// 分布式登录失败计数（Redis实现）
-async function incrementLoginFailures(email: string): Promise<number> {
-  if (redisClient) {
-    const key = `login_fail:${email}`;
-    const count = await redisClient.incr(key);
-    if (count === 1) {
-      await redisClient.expire(key, LOCKOUT_DURATION_MS / 1000);
-    }
-    return count;
-  }
-  // 回退到内存实现
-  const attempts = loginAttempts.get(email) || { count: 0 };
-  attempts.count++;
-  loginAttempts.set(email, attempts);
-  return attempts.count;
-}
-
-async function isAccountLockedDistributed(email: string): Promise<boolean> {
-  if (redisClient) {
-    const lockKey = `login_lock:${email}`;
-    const locked = await redisClient.get(lockKey);
-    return locked === '1';
-  }
-  return isAccountLocked(email);
-}
-
-async function lockAccountDistributed(email: string): Promise<void> {
-  if (redisClient) {
-    const lockKey = `login_lock:${email}`;
-    await redisClient.setEx(lockKey, LOCKOUT_DURATION_MS / 1000, '1');
-  }
-}
-
-async function clearLoginFailures(email: string): Promise<void> {
-  if (redisClient) {
-    const key = `login_fail:${email}`;
-    await redisClient.del(key);
-    const lockKey = `login_lock:${email}`;
-    await redisClient.del(lockKey);
-  }
-}
-
 /**
  * 验证 expiresIn 格式并确保不超过最大值
  */
@@ -128,62 +59,6 @@ function validateExpiresIn(value: string | undefined, maxValue: string): string 
     return maxValue;
   }
   return value;
-}
-
-/**
- * 检查账号是否被锁定
- */
-function isAccountLocked(email: string): boolean {
-  const attempts = loginAttempts.get(email);
-  if (!attempts) return false;
-  if (attempts.lockUntil && Date.now() < attempts.lockUntil) {
-    return true;
-  }
-  // 锁定期已过，重置
-  if (attempts.lockUntil) {
-    loginAttempts.delete(email);
-  }
-  return false;
-}
-
-/**
- * 记录登录失败
- */
-function recordFailedAttempt(email: string): void {
-  const attempts = loginAttempts.get(email) || { count: 0 };
-  attempts.count++;
-  if (attempts.count >= MAX_LOGIN_ATTEMPTS) {
-    attempts.lockUntil = Date.now() + LOCKOUT_DURATION_MS;
-    logger.warn({ email }, 'Account locked due to too many failed login attempts');
-  }
-  loginAttempts.set(email, attempts);
-}
-
-/**
- * 清除登录失败记录（登录成功时调用）
- */
-function clearFailedAttempts(email: string): void {
-  loginAttempts.delete(email);
-}
-
-/**
- * 检查注册频率限制
- */
-function checkRegisterRateLimit(ip: string): boolean {
-  const now = Date.now();
-  const attempts = registerAttempts.get(ip);
-  
-  if (!attempts || now > attempts.resetAt) {
-    registerAttempts.set(ip, { count: 1, resetAt: now + REGISTER_LIMIT_WINDOW_MS });
-    return true;
-  }
-  
-  if (attempts.count >= MAX_REGISTER_ATTEMPTS) {
-    return false;
-  }
-  
-  attempts.count++;
-  return true;
 }
 
 // 注册请求体验证
@@ -248,9 +123,14 @@ function hashToken(token: string): string {
  */
 router.post('/register', registerLimiter, async (req, res, next) => {
   try {
-    // 检查注册频率限制
+    // 检查注册频率限制（基于IP）
     const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
-    if (!checkRegisterRateLimit(clientIp)) {
+    const rateLimitResult = await rateLimiter.checkAndIncrement(
+      `register:${clientIp}`,
+      REGISTER_RATE_LIMIT
+    );
+    
+    if (!rateLimitResult.success) {
       res.status(429).json({
         success: false,
         error: {
@@ -345,8 +225,9 @@ router.post('/login', loginLimiter, async (req, res, next) => {
       userAgent: req.get('user-agent')
     };
 
-    // 检查账号是否被锁定（支持Redis分布式）
-    if (await isAccountLockedDistributed(email)) {
+    // 检查账号是否已被锁定（基于分布式限流状态）
+    const currentStatus = await rateLimiter.getStatus(`login:${email}`);
+    if (currentStatus && currentStatus.count >= LOGIN_RATE_LIMIT.maxAttempts) {
       await auditService.logLogin(auditContext, email, false, 'Account locked');
       res.status(423).json({
         success: false,
@@ -374,10 +255,21 @@ router.post('/login', loginLimiter, async (req, res, next) => {
     // 只有在用户存在且密码正确时才继续
     if (!user || !isValid) {
       if (user) {
-        // 使用分布式计数（Redis或内存）
-        const attempts = await incrementLoginFailures(email);
-        if (attempts >= MAX_LOGIN_ATTEMPTS) {
-          await lockAccountDistributed(email);
+        // 使用分布式限流（Redis或内存）
+        const loginResult = await rateLimiter.checkAndIncrement(
+          `login:${email}`,
+          LOGIN_RATE_LIMIT
+        );
+        if (!loginResult.success && loginResult.lockedUntil) {
+          await auditService.logLogin(auditContext, email, false, 'Account locked due to too many failed attempts');
+          res.status(423).json({
+            success: false,
+            error: {
+              code: 'ACCOUNT_LOCKED',
+              message: 'Account is temporarily locked. Please try again later.'
+            }
+          });
+          return;
         }
         await auditService.logLogin(auditContext, user.id, false, 'Invalid password');
       }
@@ -391,8 +283,8 @@ router.post('/login', loginLimiter, async (req, res, next) => {
       return;
     }
 
-    // 登录成功，清除失败记录（分布式）
-    await clearLoginFailures(email);
+    // 登录成功，清除失败记录
+    await rateLimiter.clear(`login:${email}`);
 
     // 更新最后登录时间
     await prisma.user.update({

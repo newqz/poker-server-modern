@@ -90,7 +90,11 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Note: This trigger will be applied to the users table after Prisma creates it
--- You'll need to run: DROP FUNCTION IF EXISTS prevent_negative_balance; after prisma migrate
+-- Run this after Prisma migrations:
+-- DROP TRIGGER IF EXISTS users_balance_trigger ON users;
+-- CREATE TRIGGER users_balance_trigger
+--   BEFORE UPDATE ON users
+--   FOR EACH ROW EXECUTE FUNCTION prevent_negative_balance();
 
 -- Log successful initialization
 DO $$ BEGIN

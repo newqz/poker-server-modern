@@ -20,8 +20,8 @@ model User {
   role      UserRole @default(USER)
   status    UserStatus @default(ACTIVE)
   
-  // 账户信息
-  balance   BigInt   @default(0)
+  // 账户信息 - 添加非负约束
+  balance   BigInt   @default(0) @db.Check("balance >= 0")
   
   // 统计信息
   totalGames   Int @default(0)
