@@ -8,6 +8,9 @@
     "dev": "turbo run dev --parallel",
     "lint": "turbo run lint",
     "test": "turbo run test",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:e2e:headed": "playwright test --headed",
     "typecheck": "turbo run typecheck",
     "db:migrate": "turbo run db:migrate",
     "db:generate": "turbo run db:generate",
@@ -15,6 +18,7 @@
     "clean": "turbo run clean && rm -rf node_modules"
   },
   "devDependencies": {
+    "@playwright/test": "^1.40.0",
     "turbo": "^2.0.0",
     "typescript": "^5.3.0"
   },
