@@ -13,7 +13,7 @@ import { useAuthStore, useUIStore } from '../store'
 
 export function Register() {
   const navigate = useNavigate()
-  const { setUser, setTokens } = useAuthStore()
+  const { login } = useAuthStore()
   const { isLoading, setLoading, error, setError } = useUIStore()
   
   const [formData, setFormData] = useState({
@@ -37,10 +37,10 @@ export function Register() {
     try {
       const { confirmPassword, ...registerData } = formData
       const response = await authAPI.register(registerData)
-      const { user, accessToken, refreshToken } = response.data.data
+      const { user, accessToken } = response.data.data
       
-      setUser(user)
-      setTokens(accessToken, refreshToken)
+      // refreshToken 已通过 httpOnly Cookie 设置，前端不需要存储
+      login(user, accessToken)
       
       navigate('/lobby')
     } catch (err: any) {

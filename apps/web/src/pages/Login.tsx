@@ -14,7 +14,7 @@ import { useAuthStore, useUIStore } from '../store'
 export function Login() {
   const navigate = useNavigate()
   const location = useLocation()
-  const { setUser, setTokens } = useAuthStore()
+  const { login } = useAuthStore()
   const { isLoading, setLoading, error, setError } = useUIStore()
   
   const [formData, setFormData] = useState({
@@ -31,10 +31,10 @@ export function Login() {
     
     try {
       const response = await authAPI.login(formData)
-      const { user, accessToken, refreshToken } = response.data.data
+      const { user, accessToken } = response.data.data
       
-      setUser(user)
-      setTokens(accessToken, refreshToken)
+      // refreshToken 已通过 httpOnly Cookie 设置，前端不需要存储
+      login(user, accessToken)
       
       navigate(from, { replace: true })
     } catch (err: any) {

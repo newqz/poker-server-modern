@@ -1,13 +1,17 @@
 /**
  * API 客户端
  * @module services/api
- * @author ARCH
- * @date 2026-03-26
- * @task FE-001
+ * @description API 客户端，带自动 token 刷新功能
+ * 
+ * 安全设计：
+ * - Access Token 存储在内存中
+ * - Refresh Token 在 httpOnly Cookie 中自动处理
+ * - 无需手动存储或传递 refreshToken
  */
 
 import axios from 'axios'
 import { useAuthStore } from '../store'
+import { refreshAccessToken } from './auth'
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000/api/v1'
 
@@ -17,6 +21,8 @@ export const apiClient = axios.create({
   headers: {
     'Content-Type': 'application/json',
   },
+  // 允许发送 credentials (cookies)
+  withCredentials: true
 })
 
 // 请求拦截器 - 添加 token
@@ -37,27 +43,30 @@ apiClient.interceptors.response.use(
   async (error) => {
     const originalRequest = error.config
     
+    // 401 且未重试过
     if (error.response?.status === 401 && !originalRequest._retry) {
       originalRequest._retry = true
       
       try {
-        const refreshToken = useAuthStore.getState().refreshToken
-        if (!refreshToken) {
+        // 使用 httpOnly Cookie 中的 refreshToken 自动刷新
+        const result = await refreshAccessToken()
+        
+        if (result.success && result.accessToken) {
+          // 更新内存中的 accessToken
+          useAuthStore.getState().setAccessToken(result.accessToken)
+          
+          // 重试原始请求
+          originalRequest.headers.Authorization = `Bearer ${result.accessToken}`
+          return apiClient(originalRequest)
+        } else {
+          // 刷新失败，登出
           useAuthStore.getState().logout()
+          window.dispatchEvent(new CustomEvent('auth:session_expired'))
           return Promise.reject(error)
         }
-        
-        const response = await axios.post(`${API_BASE_URL}/auth/refresh`, {
-          refreshToken,
-        })
-        
-        const { accessToken, refreshToken: newRefreshToken } = response.data.data
-        useAuthStore.getState().setTokens(accessToken, newRefreshToken)
-        
-        originalRequest.headers.Authorization = `Bearer ${accessToken}`
-        return apiClient(originalRequest)
       } catch (refreshError) {
         useAuthStore.getState().logout()
+        window.dispatchEvent(new CustomEvent('auth:session_expired'))
         return Promise.reject(refreshError)
       }
     }
@@ -74,8 +83,8 @@ export const authAPI = {
   login: (data: { email: string; password: string }) =>
     apiClient.post('/auth/login', data),
   
-  refresh: (refreshToken: string) =>
-    apiClient.post('/auth/refresh', { refreshToken }),
+  refresh: () =>
+    apiClient.post('/auth/refresh'),  // 不需要传参数，httpOnly Cookie 自动发送
 }
 
 export const roomAPI = {

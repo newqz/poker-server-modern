@@ -181,6 +181,16 @@ router.post('/register', registerLimiter, async (req, res, next) => {
 
       logger.info({ userId: user.id }, 'User registered');
 
+      // 设置 httpOnly cookie 用于 refresh token
+      const isProduction = process.env.NODE_ENV === 'production';
+      res.cookie('refreshToken', refreshToken, {
+        httpOnly: true,
+        secure: isProduction,
+        sameSite: 'strict',
+        maxAge: 7 * 24 * 60 * 60 * 1000, // 7天
+        path: '/api/v1/auth'  // 只在 auth 路由发送
+      });
+
       res.status(201).json({
         success: true,
         data: {
@@ -188,8 +198,8 @@ router.post('/register', registerLimiter, async (req, res, next) => {
             ...user,
             balance: Number(user.balance)
           },
-          accessToken,
-          refreshToken
+          accessToken
+          // 不返回 refreshToken（已通过 httpOnly Cookie 设置）
         }
       });
     } catch (error) {

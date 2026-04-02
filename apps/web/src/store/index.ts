@@ -23,41 +23,39 @@ export interface User {
 interface AuthState {
   user: User | null
   accessToken: string | null
-  refreshToken: string | null
   isAuthenticated: boolean
   
-  // Atomic login - 避免中间状态
-  login: (user: User, accessToken: string, refreshToken: string) => void
+  // Atomic login - 只存储 accessToken，refreshToken 在 httpOnly Cookie 中
+  login: (user: User, accessToken: string) => void
+  setAccessToken: (token: string) => void
   logout: () => void
 }
 
 export const useAuthStore = create<AuthState>()(
   // 中间件：开发环境使用 devtools
   ...middleware,
-  // 不使用 persist middleware，token 存在内存中
+  // 不使用 persist middleware，token 存在内存中（更安全）
   (set) => ({
     user: null,
     accessToken: null,
-    refreshToken: null,
     isAuthenticated: false,
     
-    // 原子登录操作
-    login: (user, accessToken, refreshToken) => set({ 
+    // 原子登录操作 - 不再存储 refreshToken
+    login: (user, accessToken) => set({ 
       user, 
-      accessToken, 
-      refreshToken,
+      accessToken,
       isAuthenticated: true 
     }),
     
+    // 仅更新 accessToken（用于刷新时）
+    setAccessToken: (token) => set({ accessToken: token }),
+    
     // 登出 - 清除所有状态
     logout: () => {
-      // 清除持久化存储
-      localStorage.removeItem('poker-auth-storage');
       // 重置状态
       set({ 
         user: null, 
         accessToken: null, 
-        refreshToken: null, 
         isAuthenticated: false 
       });
     },
