@@ -13,22 +13,29 @@ import { gameRouter } from './game';
 import { userRouter } from './user';
 import { authenticate } from '../middleware/authenticate';
 import { verifySignature } from '../middleware/requestSignature';
+import {
+  defaultRateLimit,
+  authRateLimit,
+  gameActionRateLimit,
+  searchRateLimit
+} from '../middleware/rateLimit';
 
 export function setupRoutes(app: Application): void {
   // API 版本前缀
   const API_PREFIX = '/api/v1';
 
-  // 健康检查 (已在 server.ts 中定义，这里不再重复)
-  
-  // 认证路由 - 无需认证，但有速率限制（在 auth.ts 中实现）
-  app.use(`${API_PREFIX}/auth`, authRouter);
-  
-  // 房间路由 - 需要认证 + 可选签名验证
+  // 全局限流 - 默认
+  app.use(`${API_PREFIX}`, defaultRateLimit);
+
+  // 认证路由 - 使用更严格的限流
+  app.use(`${API_PREFIX}/auth`, authRateLimit, authRouter);
+
+  // 房间路由 - 需要认证
   app.use(`${API_PREFIX}/rooms`, authenticate, roomRouter);
-  
-  // 游戏路由 - 需要认证
-  app.use(`${API_PREFIX}/games`, authenticate, gameRouter);
-  
+
+  // 游戏路由 - 需要认证 + 游戏限流
+  app.use(`${API_PREFIX}/games`, gameActionRateLimit, authenticate, gameRouter);
+
   // 用户路由 - 需要认证
   app.use(`${API_PREFIX}/users`, authenticate, userRouter);
 
