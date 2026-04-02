@@ -432,6 +432,10 @@ export class GameEngine {
           player.betAmount += allInAmount;
           player.chips = 0;
           player.isAllIn = true;
+          
+          // 全押时计算玩家的总投入
+          const totalBet = this.state.bettingRound.getPlayerBetInRound(playerId) + allInAmount;
+          
           this.state.bettingRound.addToPot(allInAmount, playerId);
           chipChange = {
             playerId,
@@ -444,6 +448,9 @@ export class GameEngine {
           if (player.betAmount > this.state.bettingRound.getCurrentBet()) {
             this.state.bettingRound.recordAction(playerId, action, player.betAmount);
           }
+          
+          // 创建边池（如果有其他玩家投入更多）
+          this.state.bettingRound.createSidePot(playerId, totalBet);
         }
         break;
     }

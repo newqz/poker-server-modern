@@ -380,19 +380,29 @@ export class GameService {
   private async endGame(gameId: string, state: any) {
     // 使用事务确保游戏状态、筹码分配和获胜者更新的原子性
     await prisma.$transaction(async (tx) => {
+      // 获取底池信息（主池和边池）
+      const pots = state.bettingRound?.getPots ? state.bettingRound.getPots() : [];
+      const mainPot = state.pot || 0;
+      const sidePots = pots.slice(1).map((p: any) => ({
+        amount: p.amount,
+        eligiblePlayers: p.eligiblePlayers
+      }));
+      
       // 更新游戏记录
       await tx.game.update({
         where: { id: gameId },
         data: {
           status: GameStatus.ENDED,
-          endedAt: new Date()
+          endedAt: new Date(),
+          mainPot: BigInt(mainPot),
+          sidePots: sidePots.length > 0 ? sidePots as any : undefined
         }
       });
 
       // 分配筹码给获胜者
       if (state.winners) {
         for (const winner of state.winners) {
-          // 给赢家发放筹码
+          // 给赢家发放筹码（winner.amount 已经包含了所有池的分配）
           await tx.user.update({
             where: { id: winner.playerId },
             data: {
@@ -488,7 +498,31 @@ export class GameService {
     }
 
     const state = gameEngine.getState();
-    const stateJson = JSON.stringify(state);
+    
+    // 序列化时排除 BettingRound 的方法，只保留数据
+    const serializableState = {
+      id: state.id,
+      roomId: state.roomId,
+      status: state.status,
+      round: state.round,
+      communityCards: state.communityCards,
+      players: state.players,
+      dealerSeat: state.dealerSeat,
+      smallBlindSeat: state.smallBlindSeat,
+      bigBlindSeat: state.bigBlindSeat,
+      currentPlayerSeat: state.currentPlayerSeat,
+      pot: state.pot,
+      lastAction: state.lastAction,
+      winners: state.winners,
+      // 序列化 BettingRound 数据
+      bettingRound: {
+        actions: state.bettingRound.getActions(),
+        currentBet: state.bettingRound.getCurrentBet(),
+        pots: state.bettingRound.getPots()
+      }
+    };
+    
+    const stateJson = JSON.stringify(serializableState);
     
     // 校验快照大小（最大 1MB）
     const MAX_SNAPSHOT_SIZE = 1024 * 1024; // 1MB
@@ -504,12 +538,12 @@ export class GameService {
         where: { gameId_type: { gameId, type } },
         create: {
           gameId,
-          state: state as any,
+          state: serializableState as any,
           type,
           checksum
         },
         update: {
-          state: state as any,
+          state: serializableState as any,
           type,
           checksum,
           createdAt: new Date()
