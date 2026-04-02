@@ -13,19 +13,25 @@ const prisma = new PrismaClient();
 const THRESHOLDS = {
   // 玩家行为
   MAXActionsPerSecond: 5,           // 每秒最大动作数
-  MINActionIntervalMs: 200,         // 最小动作间隔 (毫秒)
+  MINActionIntervalMs: 150,        // 最小动作间隔 (毫秒)
+  
+  // 变速挂检测
+  SPEED_HACK_VARIANCE_THRESHOLD: 0.3, // 反应时间方差阈值 (0.3秒)
+  MIN_REACTION_TIME_MS: 150,          // 人类最小反应时间
+  MAX_REACTION_TIME_MS: 5000,         // 人类最大反应时间
   
   // 资金异常
-  MAXBalanceChangePercent: 500,    // 单局余额变化最大值 (%)
-  MAXBuyInPerHour: 50,             // 每小时最大买入次数
-  MAXWinRate: 0.85,               // 最大胜率 (异常高)
+  MAXBalanceChangePercent: 500,       // 单局余额变化最大值 (%)
+  MAXBuyInPerHour: 50,              // 每小时最大买入次数
+  MAXWinRate: 0.85,                // 最大胜率 (异常高)
   
   // 伙牌检测
-  MAXSameIPPlayers: 2,            // 同IP最大玩家数
-  MAXSimilarActionPattern: 0.9,   // 动作模式相似度阈值
+  MAXSameIPPlayers: 2,             // 同IP最大玩家数
+  MAXSimilarActionPattern: 0.9,     // 动作模式相似度阈值
+  MIN_GAMES_FOR_COLLUSION: 10,    // 伙牌检测最小游戏数
   
   // 账户安全
-  MAXLoginAttemptsPerHour: 10,    // 每小时最大登录尝试
+  MAXLoginAttemptsPerHour: 10,     // 每小时最大登录尝试
   MAXAccountAgeHoursForLargeWin: 24, // 大额盈利的最小账户年龄
 };
 
@@ -35,6 +41,14 @@ interface PlayerAction {
   timestamp: Date;
   gameId: string;
   amount?: number;
+}
+
+interface PlayerReactionStats {
+  playerId: string;
+  meanReactionTime: number;
+  variance: number;
+  sampleCount: number;
+  isSpeedHacker: boolean;
 }
 
 interface RiskScore {
@@ -54,12 +68,14 @@ interface RiskFlag {
 type RiskFlagType =
   | 'RAPID_ACTIONS'
   | 'IMPOSSIBLE_REACTION_TIME'
+  | 'SPEED_HACKING_DETECTED'
   | 'SUSPICIOUS_WIN_RATE'
   | 'BALANCE_ANOMALY'
   | 'MULTIPLE_ACCOUNTS_SAME_IP'
   | 'COLLUSION_DETECTED'
   | 'BOT_LIKE_BEHAVIOR'
-  | 'UNUSUAL_BETTING_PATTERN';
+  | 'UNUSUAL_BETTING_PATTERN'
+  | 'LOCATION_ANOMALY';
 
 /**
  * 反作弊服务
@@ -146,6 +162,20 @@ export class AntiCheatService {
     if (balanceFlag) {
       flags.push(balanceFlag);
       totalScore += this.severityToScore(balanceFlag.severity);
+    }
+    
+    // 6. 变速挂检测
+    const speedFlag = await this.checkSpeedHacking(playerId);
+    if (speedFlag) {
+      flags.push(speedFlag);
+      totalScore += this.severityToScore(speedFlag.severity);
+    }
+    
+    // 7. 投注模式分析
+    const bettingFlag = await this.checkBettingPattern(playerId);
+    if (bettingFlag) {
+      flags.push(bettingFlag);
+      totalScore += this.severityToScore(bettingFlag.severity);
     }
     
     // 保存风险报告到数据库
@@ -394,6 +424,138 @@ export class AntiCheatService {
           similarity,
           threshold: THRESHOLDS.MAXSimilarActionPattern,
           playerIds
+        }
+      };
+    }
+    
+    return null;
+  }
+
+  /**
+   * 变速挂检测 - 分析玩家反应时间方差
+   * 正常人类玩家的反应时间有自然的方差
+   * 变速挂会在关键时刻突然变快，导致方差异常小
+   */
+  async checkSpeedHacking(playerId: string): Promise<RiskFlag | null> {
+    const actions = this.actionCache.get(playerId) || [];
+    
+    // 需要足够的样本
+    if (actions.length < 10) return null;
+    
+    // 计算反应时间统计
+    const stats = this.calculateReactionStats(actions);
+    
+    if (!stats) return null;
+    
+    // 检测异常：方差太小（反应时间过于一致）
+    // 正常人类方差应该 > 0.3 秒
+    if (stats.variance < THRESHOLDS.SPEED_HACK_VARIANCE_THRESHOLD && stats.sampleCount > 20) {
+      return {
+        type: 'SPEED_HACKING_DETECTED',
+        severity: stats.variance < 0.1 ? 'critical' : 'high',
+        description: `检测到变速挂: 反应时间方差异常小 (${stats.variance.toFixed(3)})`,
+        details: {
+          variance: stats.variance,
+          meanReactionTime: stats.meanReactionTime,
+          sampleCount: stats.sampleCount,
+          threshold: THRESHOLDS.SPEED_HACK_VARIANCE_THRESHOLD
+        }
+      };
+    }
+    
+    // 检测异常：所有反应都接近人类极限
+    // 正常玩家有时快有时慢，但变速挂总是接近极限
+    const allNearLimit = stats.meanReactionTime < 200 && stats.variance < 0.5;
+    if (allNearLimit && stats.sampleCount > 30) {
+      return {
+        type: 'BOT_LIKE_BEHAVIOR',
+        severity: 'high',
+        description: `检测到类机器人行为: 反应时间持续接近人类极限`,
+        details: {
+          meanReactionTime: stats.meanReactionTime,
+          variance: stats.variance,
+          threshold: THRESHOLDS.MIN_REACTION_TIME_MS
+        }
+      };
+    }
+    
+    return null;
+  }
+
+  /**
+   * 计算玩家反应时间统计
+   */
+  private calculateReactionStats(actions: PlayerAction[]): PlayerReactionStats | null {
+    if (actions.length < 2) return null;
+    
+    // 按时间排序
+    const sorted = [...actions].sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+    
+    // 计算相邻动作的时间间隔
+    const intervals: number[] = [];
+    for (let i = 1; i < sorted.length; i++) {
+      const interval = sorted[i].timestamp.getTime() - sorted[i - 1].timestamp.getTime();
+      // 过滤掉不合理的时间间隔（游戏回合间可能很长）
+      if (interval >= THRESHOLDS.MIN_REACTION_TIME_MS && interval <= THRESHOLDS.MAX_REACTION_TIME_MS) {
+        intervals.push(interval);
+      }
+    }
+    
+    if (intervals.length < 5) return null;
+    
+    // 计算均值和方差
+    const mean = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+    const variance = intervals.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / intervals.length;
+    
+    return {
+      playerId: actions[0].playerId,
+      meanReactionTime: mean,
+      variance: variance / 1000000, // 转换为秒
+      sampleCount: intervals.length,
+      isSpeedHacker: variance < THRESHOLDS.SPEED_HACK_VARIANCE_THRESHOLD
+    };
+  }
+
+  /**
+   * 投注模式分析 - 检测异常投注行为
+   */
+  async checkBettingPattern(playerId: string): Promise<RiskFlag | null> {
+    const actions = this.actionCache.get(playerId) || [];
+    
+    // 提取所有带金额的动作
+    const bettingActions = actions.filter(a => a.amount && a.amount > 0);
+    
+    if (bettingActions.length < 5) return null;
+    
+    // 计算投注金额的统计
+    const amounts = bettingActions.map(a => a.amount!);
+    const mean = amounts.reduce((a, b) => a + b, 0) / amounts.length;
+    const variance = amounts.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / amounts.length;
+    const stdDev = Math.sqrt(variance);
+    
+    // 方差为0意味着每次投注金额完全相同（可疑）
+    if (stdDev === 0 && amounts.length > 10) {
+      return {
+        type: 'UNUSUAL_BETTING_PATTERN',
+        severity: 'medium',
+        description: `投注模式异常: 所有投注金额完全相同`,
+        details: {
+          amount: mean,
+          count: amounts.length
+        }
+      };
+    }
+    
+    // 检测 Always All-In 模式
+    const allInCount = bettingActions.filter(a => a.amount! > 5000).length; // 假设5000是大额
+    if (allInCount / bettingActions.length > 0.9 && bettingActions.length > 20) {
+      return {
+        type: 'BOT_LIKE_BEHAVIOR',
+        severity: 'medium',
+        description: `检测到机器人行为: 频繁全押`,
+        details: {
+          allInRatio: allInCount / bettingActions.length,
+          totalBets: bettingActions.length
         }
       };
     }

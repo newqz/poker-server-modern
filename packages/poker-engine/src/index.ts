@@ -10,3 +10,5 @@ export { Deck } from './deck/Deck';
 export { HandEvaluator } from './evaluator/HandEvaluator';
 export { GameEngine, GamePlayer, GameState } from './game/GameEngine';
 export { BettingRound, BettingAction, Pot } from './game/BettingRound';
+export { ProvablyFair, CardUtils } from './crypto/ProvablyFair';
+export type { SeedPair, DealResult } from './crypto/ProvablyFair';
