@@ -13,11 +13,15 @@
 import type { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
 import { PrismaClient } from '@prisma/client';
-import { ClientEvents, ServerEvents } from '@poker/shared';
+import { ClientEvents, ServerEvents, PlayerAction } from '@poker/shared';
+
+const prisma = new PrismaClient();
 import { logger } from '../utils/logger';
 import { escapeHtml } from '../utils/serialize';
 import { GameService } from './game';
 import { auditService } from './audit';
+
+const gameService = new GameService();
 
 // Redis 客户端（用于跨实例共享状态）
 let redisClient: any = null;
@@ -142,13 +146,13 @@ async function emitToUserSocket(io: Server, userId: string, event: string, data:
 /**
  * 设置玩家操作超时
  */
-function setPlayerActionTimeout(
+async function setPlayerActionTimeout(
   io: Server,
   gameId: string,
   roomId: string,
   playerId: string,
   timeoutSeconds: number
-): void {
+): Promise<void> {
   // 清除之前的超时
   clearPlayerActionTimeout(gameId, playerId);
   
@@ -158,13 +162,13 @@ function setPlayerActionTimeout(
       if (!gameState) return;
       
       // 执行自动弃牌
-      const result = await gameService.processAction(gameId, playerId, 'fold');
+      const result = await gameService.processAction(gameId, playerId, PlayerAction.FOLD);
       
       // 广播动作（使用 Redis adapter 确保跨实例）
       io.to(roomId).emit(ServerEvents.PLAYER_ACTION, {
         userId: playerId,
         username: 'System',
-        action: 'fold',
+        action: PlayerAction.FOLD,
         amount: 0,
         autoAction: true
       });
@@ -178,7 +182,7 @@ function setPlayerActionTimeout(
           gameId,
           timeout: 30
         });
-        setPlayerActionTimeout(io, gameId, roomId, result.nextPlayerId, 30);
+        await setPlayerActionTimeout(io, gameId, roomId, result.nextPlayerId, 30);
       }
       
       logger.info({ gameId, playerId }, 'Player auto-folded due to timeout');
@@ -608,12 +612,12 @@ export function setupSocketHandlers(io: Server): void {
                   );
                   
                   if (playerInGame) {
-                    const result = await gameService.processAction(gameId, socket.userId!, 'fold');
+                    const result = await gameService.processAction(gameId, socket.userId!, PlayerAction.FOLD);
                     
                     io.to(roomId).emit(ServerEvents.PLAYER_ACTION, {
                       userId: socket.userId,
                       username: 'System',
-                      action: 'fold',
+                      action: PlayerAction.FOLD,
                       amount: 0,
                       autoAction: true
                     });

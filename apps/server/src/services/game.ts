@@ -7,10 +7,10 @@
  * @description 处理游戏逻辑的高层服务
  */
 
-import { PrismaClient, GameStatus, GameRound, PlayerAction, SnapshotType } from '@prisma/client';
+import { PrismaClient, GameRound, PlayerAction, SnapshotType } from '@prisma/client';
 import type { Socket } from 'socket.io';
 import { GameEngine, GamePlayer } from '@poker/engine';
-import { generateRoomCode } from '@poker/shared';
+import { generateRoomCode, GameStatus } from '@poker/shared';
 import { logger } from '../utils/logger';
 import { antiCheatService } from './antiCheat';
 
@@ -365,7 +365,7 @@ export class GameService {
     }
 
     // 检查游戏是否结束
-    if (result.newState.status === 'ENDED' || result.newState.status === 'SHOWDOWN') {
+    if (result.newState.status === GameStatus.ENDED || result.newState.status === GameStatus.SHOWDOWN) {
       await this.endGame(gameId, result.newState);
     } else {
       // 游戏进行中，保存快照

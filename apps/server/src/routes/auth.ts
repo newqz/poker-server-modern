@@ -97,13 +97,13 @@ function generateTokens(userId: string) {
   const accessToken = jwt.sign(
     { userId, type: 'access' },
     jwtSecret,
-    { expiresIn: accessExpiresIn as string }
+    { expiresIn: accessExpiresIn }
   );
 
   const refreshToken = jwt.sign(
     { userId, type: 'refresh' },
     jwtRefreshSecret,
-    { expiresIn: refreshExpiresIn as string }
+    { expiresIn: refreshExpiresIn }
   );
 
   return { accessToken, refreshToken };

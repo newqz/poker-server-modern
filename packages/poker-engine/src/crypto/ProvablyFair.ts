@@ -95,19 +95,17 @@ export class ProvablyFair {
     // 生成随机序列
     const cards = this.generateCardSequence(count, usedClientSeed);
     
-    const result: DealResult = {
-      cards,
-      seedPair: {
-        serverSeed: this.serverSeed,
-        serverSeedHash: this.serverSeedHash,
-        clientSeed: usedClientSeed,
-        nonce: this.nonce
-      },
-      hash: this.hashWithSHA256(JSON.stringify({ cards, ...result.seedPair }))
+    const seedPair: SeedPair = {
+      serverSeed: this.serverSeed,
+      serverSeedHash: this.serverSeedHash,
+      clientSeed: usedClientSeed,
+      nonce: this.nonce
     };
 
+    const hash = this.hashWithSHA256(JSON.stringify({ cards, ...seedPair }));
+
     this.nonce++;
-    return result;
+    return { cards, seedPair, hash };
   }
 
   /**

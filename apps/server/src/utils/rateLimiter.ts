@@ -192,7 +192,7 @@ export class DistributedRateLimiter {
     try {
       const count = await this.redis!.get(`ratelimit:${key}`);
       if (count === null) return null;
-      return { count: parseInt(count, 10), remaining: Math.max(0, 5 - parseInt(count, 10)) };
+      return { count: parseInt(count as string, 10), remaining: Math.max(0, 5 - parseInt(count as string, 10)) };
     } catch {
       return null;
     }

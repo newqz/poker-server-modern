@@ -165,10 +165,10 @@ export class AntiCheatService {
     }
     
     // 6. 变速挂检测
-    const speedFlag = await this.checkSpeedHacking(playerId);
-    if (speedFlag) {
-      flags.push(speedFlag);
-      totalScore += this.severityToScore(speedFlag.severity);
+    const speedHackingFlag = await this.checkSpeedHacking(playerId);
+    if (speedHackingFlag) {
+      flags.push(speedHackingFlag);
+      totalScore += this.severityToScore(speedHackingFlag.severity);
     }
     
     // 7. 投注模式分析

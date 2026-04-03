@@ -786,7 +786,7 @@ export class GameEngine {
     if (this.stateSnapshot) {
       this.state = JSON.parse(JSON.stringify(this.stateSnapshot));
       this.stateSnapshot = null;
-      logger.info({ gameId: this.state.id }, 'Game state rolled back');
+      logger.info('Game state rolled back', { gameId: this.state.id });
     }
   }
 }
